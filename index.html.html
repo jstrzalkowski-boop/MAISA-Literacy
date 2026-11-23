@@ -1,0 +1,3086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><script type='text/javascript' >
+
+const blockedImages = [];
+const processingImages = {};
+const scoredImages = {};
+const scoreQueue = [];
+const vidMatcher = /google\.com\/search\?.*vid:([^#\&\?]{11})/;
+
+let runningScan = false;
+let processingQueue = false;
+let observer, prevVideo;
+
+// //
+// gather content for flagging
+function gatherContent() {
+  let text = '';
+
+  const title = document.querySelector("meta[property='og:title']");
+  if (title) {
+    text += title.getAttribute('content');
+  }
+
+  const content = document.querySelector("meta[property='og:description']");
+  if (content) {
+    text += ' ' + content.getAttribute('content');
+  }
+
+  return text;
+}
+
+// //
+// add to score queue
+function queueScore(imgId, imgUrl, type) {
+  // Check if already queued
+  const alreadyQueued = scoreQueue.some(item => item.imgId === imgId);
+  if (alreadyQueued) {
+    return;
+  }
+
+  scoreQueue.push({ imgId, imgUrl, type });
+  console.debug('[LS Filter] queued score ->', imgId, imgUrl);
+  
+  // Start processing if not already running
+  if (!processingQueue) {
+    processScoreQueue();
+  }
+}
+
+// //
+// process score queue one at a time
+async function processScoreQueue() {
+  if (processingQueue || scoreQueue.length === 0) {
+    return;
+  }
+
+  processingQueue = true;
+
+  while (scoreQueue.length > 0) {
+    const item = scoreQueue.shift();
+    
+    // Skip if already scored
+    if (scoredImages[item.imgId]) {
+      continue;
+    }
+
+    // Mark as processing
+    processingImages[item.imgId] = {
+      expire: setTimeout(() => {
+        delete processingImages[item.imgId];
+      }, 10000)
+    };
+
+    console.debug('[LS Filter] scoring ->', item.imgId, item.imgUrl);
+
+    // Score the URL and wait for result
+    await new Promise((resolve) => {
+      scoreUrl({ url: item.imgUrl, type: item.type }, (results) => {
+        handleScoredImage(item.imgId, results);
+        resolve();
+      });
+    });
+
+    // Small delay between scores to prevent overwhelming
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  processingQueue = false;
+}
+
+// //
+// apply image score results
+function handleScoredImage(imgId, results) {
+  scoredImages[imgId] = results;
+  const pi = processingImages[imgId];
+  if (pi) {
+    clearTimeout(pi.expire);
+    delete processingImages[imgId];
+  }
+
+  if (results.allow === 'blocked') {
+    // Only add if not already in blockedImages array
+    if (!blockedImages.includes(imgId)) {
+      blockedImages.push(imgId);
+      console.debug('[LS Filter] image blocked ->', imgId);
+      applyImageBlock(imgId);
+    }
+  }
+}
+
+// //
+// apply image block
+function applyImageBlock(id) {
+  const img = document.getElementById(id);
+  if (img && img.src !== blockImg) {
+    img.src = blockImg;
+  }
+}
+
+// //
+// keep image blocked
+function keepBlocked() {
+  blockedImages.forEach((imgId) => {
+    applyImageBlock(imgId);
+  });
+  setTimeout(keepBlocked, 2000);
+}
+
+// //
+// find the nearest node with the attribute
+function findNearest(node, attr) {
+  let i = 0;
+  while (i < 10) {
+    if (node && node.hasAttribute && node.hasAttribute(attr)) {
+      return node;
+    } else if (node && node.parentNode) {
+      node = node.parentNode;
+      i++;
+      continue;
+    }
+    return;
+  }
+}
+
+// //
+// find the next node with the attribute
+function findNext(node, attr) {
+  let i = 0;
+  while (i < 10) {
+    if (node && node.hasAttribute && node.hasAttribute(attr)) {
+      return node;
+    } else if (node && node.firstChild) {
+      node = node.firstChild;
+      i++;
+      continue;
+    }
+    return;
+  }
+}
+
+// //
+// scan images
+function imageScan() {
+  if (runningScan) {
+    return;
+  }
+  runningScan = true;
+
+  // legacy google image search
+  let links = document.getElementsByTagName('a');
+
+  // new google image search
+  if (links.length === 0) {
+    const search = document.getElementById('search');
+    if (search) {
+      links = search.querySelectorAll('g-img');
+    }
+  }
+
+  const imgResRegex = /imgres\?.*imgurl=/;
+  const googleUrlRegex = /google\.com\/url\?/;
+
+  for (let i = 0; i < links.length; i++) {
+    let imgId, imgUrl, el;
+    const imgEl = links[i];
+
+    // legacy google image search
+    if (imgEl.href && (imgResRegex.exec(imgEl.href) || googleUrlRegex.exec(imgEl.href))) {
+      imgUrl = imgEl.href;
+    }
+
+    // new google image search
+    if (!imgUrl) {
+      const dl = findNearest(imgEl, 'data-lpage');
+      if (dl) {
+        imgUrl = dl.getAttribute('data-lpage');
+      }
+    }
+
+    // find the image source
+    if (imgUrl) {
+      const src = findNext(imgEl, 'src');
+      if (src) {
+        el = src;
+      }
+    }
+    
+    // find or make the image id
+    if (!el || !imgUrl || (!imgUrl.startsWith('http://') && !imgUrl.startsWith('https://'))) {
+      continue;
+    }
+
+    // ignore ours
+    if (el.src && el.src.includes(blockImg)) {
+      continue;
+    }
+
+    if (el.id !== '') {
+      imgId = el.id;
+    } else {
+      imgId = Math.random().toString(36).substring(2, 15);
+      el.id = imgId;
+    }
+
+    // processing or scored - skip
+    if (processingImages[imgId] || scoredImages[imgId]) {
+      continue;
+    }
+
+    // Add to queue
+    queueScore(imgId, imgUrl, 'image');
+  }
+  
+  altImageScan();
+  runningScan = false;
+}
+
+// //
+// alternate image scan
+function altImageScan() {
+  document.querySelectorAll('a[data-ved], div[data-ved]').forEach(aEl => {
+    const imgEl = aEl.querySelector('img');
+    if (imgEl && imgEl.src && imgEl.src.startsWith('http') && !imgEl.src.includes(blockImg)) {
+      console.debug('[LS Filter] found alt google image src ->', imgEl.src);
+      
+      // Get the image URL from the anchor's href
+      let imgUrl = aEl.href;
+      if (!imgUrl || (!imgUrl.startsWith('http://') && !imgUrl.startsWith('https://'))) {
+        return;
+      }
+
+      // Create or get image ID
+      let imgId;
+      if (imgEl.id !== '') {
+        imgId = imgEl.id;
+      } else {
+        imgId = Math.random().toString(36).substring(2, 15);
+        imgEl.id = imgId;
+      }
+      
+      // Skip if already processing or scored
+      if (processingImages[imgId] || scoredImages[imgId]) {
+        return;
+      }
+      
+      // Add to queue
+      queueScore(imgId, imgUrl, 'image');
+    }
+  });
+}
+
+function unloadMutationObserver() {
+  if (typeof(observer) !== 'undefined') {
+    observer.disconnect();
+  }
+}
+
+window.addEventListener('beforeunload', async () => {
+  unloadMutationObserver();
+  console.debug('[LS Filter] cleanup');
+});
+
+function monitorGoogle() {
+  imageScan();
+  keepBlocked();
+
+  if (typeof(observer) !== 'undefined') {
+    observer.disconnect();
+  }
+
+  observer = new MutationObserver(() => {
+    console.debug('[LS Filter] change detected');
+    imageScan();
+
+    // score embeds
+    const m = window.location.href.match(vidMatcher)
+    if (m) {
+      const video = m[1];
+      if (video === prevVideo) {
+        return;
+      }           
+      console.log('[LS Filter] scoring search video ->', video);
+      prevVideo = video;
+      queueScore(video, 'https://www.youtube.com/watch?v=' + video, 'youtube');
+    }
+  })
+  observer.observe(document, {subtree: true, childList: true});
+}
+monitorGoogle();
+
+
+const lsijVersion = 1;
+
+
+
+class Flags {
+	constructor(url, terms) {
+		this.url = url;
+		this.matched = {};
+
+		this.terms = [];
+		terms.forEach((term) => {
+			let s = term.replace(/[\]{}?^$().*\\+|[]/g, '\\$&');
+			s = s.replace(/\\\*/g, '.*');
+			s = s.replace(/\\\?/g, '.');
+			let regex = new RegExp('\\b' + s + '\\b', 'gi');
+
+			this.terms.push({term: term, regex: regex});
+		});
+	}
+
+	report(flags) {
+		if (!flags.length) {
+			return;
+		}
+		console.debug('[LS Filter] sending -> ', flags);
+
+		const xhr = new XMLHttpRequest();
+		xhr.open('POST', document.location.origin + '/70402246ff41f8a3bd2ff7ab3f241afb68d126559346b83df799a97378542e04/log_flag', true);
+		xhr.send(JSON.stringify({
+			url: this.url.href,
+			flags: flags,
+			at_epoch_ms: Date.now()
+		}));
+	}
+
+	matchTerms(input) {
+		const matches = [];
+		this.terms.forEach((term) => {
+			if (this.matched[term.term]) {
+				return;
+			}
+
+			const hits = input.match(term.regex);
+			if (!hits || !hits.length) {
+				return;
+			}
+
+			this.matched[term.term] = hits.length;
+			matches.push([term.term, hits.length]);
+		});
+
+		return matches;
+	}
+
+	scanIntentValue(value) {
+		const matches = this.matchTerms(value);
+		const changes = [];
+
+		matches.forEach((match) => {
+			match[2] = true; // mark as user entered
+			changes.push(match);
+		});
+
+		if (changes.length) {
+			this.report(changes);
+		}
+	}
+
+	scanIntentValues(values) {
+		values.forEach((value) => {
+			this.scanIntentValue(value);
+		});
+	}
+
+	scanIntentEvent(event) {
+		switch (event.target.tagName.toLowerCase()) {
+		case 'input':
+			let type = event.target.type || 'text';
+			type = type.toLowerCase();
+
+			// Dont scan password fields
+			if (type === 'password') {
+				return;
+			}
+
+			this.scanIntentValue(event.target.value);
+			break;
+
+		case 'textarea':
+			this.scanIntentValue(event.target.value);
+			break;
+
+		}
+	}
+
+	scanIntent() {
+		if (typeof(gatherIntent) === 'function') {
+			const intent = gatherIntent();
+			if (intent.length) {
+				this.scanIntentValues(intent);
+			}
+		}
+	}
+
+	onChange(event) {
+		this.scanIntentEvent(event);
+	}
+
+	onKeyup(event) {
+		this.scanIntentEvent(event);
+	}
+
+	bindDOM() {
+		document.addEventListener('change', this.onChange.bind(this));
+		document.addEventListener('keyup', this.onKeyup.bind(this));
+		setInterval(() => {
+			this.scanIntent();
+		}, 1000);
+	}
+}
+
+function initFlagScanning() {
+	const xhr = new XMLHttpRequest();
+	xhr.open('POST', document.location.origin + '/70402246ff41f8a3bd2ff7ab3f241afb68d126559346b83df799a97378542e04/get_flags', false);
+	xhr.send(JSON.stringify({}));
+	
+	let terms = [];
+	if (xhr.status === 200) {
+		try {
+			terms = JSON.parse(xhr.responseText);
+		} catch (e) {
+			console.error('[LS Filter] failed to parse flagged terms:', e);
+		}
+	}
+
+	if (!terms.length) {
+		return;
+	}
+
+	console.debug('[LS Filter] init flag scanning');
+	const a = document.createElement('A');
+	a.href = window.location.href;
+	const flags = new Flags(a, terms);
+
+	
+	console.debug('[LS Filter] flagging page scan');
+	
+	let lastContent = '';
+	const scanAndReport = function() {
+		console.debug('[LS Filter] scanAndReport');
+		try {
+			// Make sure we are up to date on our url
+			if (a.href !== window.location.href) {
+				console.debug('[LS Filter] location changed');
+				a.href = window.location.href;
+			}
+
+			let content = '';
+			if (typeof(gatherContent) === 'function') {
+				content = gatherContent();
+			} else if (document.body) {
+				content += document.body.innerText;
+			}
+
+			// Only scan text if changed
+			if (content === lastContent) {
+				return;
+			}
+			lastContent = content;
+
+			// Match
+			const matches = flags.matchTerms(content);
+			if (matches.length) {
+				console.debug('[LS Filter] matched terms: ', matches);
+				flags.report(matches);
+			}
+		} catch (e) {
+			console.error(e);
+		}
+	};
+
+	setInterval(scanAndReport, 5000);
+	scanAndReport();
+	
+};
+
+initFlagScanning();
+
+
+
+const blockImg = "/70402246ff41f8a3bd2ff7ab3f241afb68d126559346b83df799a97378542e04/blocked-image-search.png";
+
+let hardBlockPolicy;
+
+function scoreUrl(body, callback) {
+  const xhr = new XMLHttpRequest();
+  const checkUrl = document.location.origin + '/70402246ff41f8a3bd2ff7ab3f241afb68d126559346b83df799a97378542e04/log';
+  xhr.open('POST', checkUrl, true);
+  xhr.send(JSON.stringify(body));
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) { // Request completed
+      if (this.status === 200 && xhr.responseText) {
+        try {
+          const score = JSON.parse(xhr.responseText);
+          if (callback) {
+            callback(score);
+          } else {
+            console.log('[LS Filter] score ->', score.allow);
+            if (score.redirect) {
+              window.location.href = score.redirect;
+              hardBlock();
+            }
+          }
+        } catch (err) {
+          console.error('[LS Filter] error parsing score response ->', err);
+          if (callback) {
+            callback({ allow: 'error', error: err.message });
+          }
+        }
+      } else {
+        // HTTP error or empty response
+        console.error('[LS Filter] score request failed ->', this.status, xhr.statusText);
+        if (callback) {
+          callback({ allow: 'error', error: `HTTP ${this.status}` });
+        }
+      }
+    }
+  };
+  
+  // Handle network errors
+  xhr.onerror = function() {
+    console.error('[LS Filter] score request network error');
+    if (callback) {
+      callback({ allow: 'error', error: 'network error' });
+    }
+  };
+  
+  // Handle timeout
+  xhr.ontimeout = function() {
+    console.error('[LS Filter] score request timeout');
+    if (callback) {
+      callback({ allow: 'error', error: 'timeout' });
+    }
+  };
+}
+
+function getHardBlockPolicy() {
+  if (typeof(trustedTypes) !== 'undefined' && !hardBlockPolicy) {
+    hardBlockPolicy = trustedTypes.createPolicy('hardBlock', {
+      createHTML: (string) => string
+    });
+  }
+  return hardBlockPolicy;
+}
+
+function hardBlock() {
+  pauseVideo();
+  const stopInt = setInterval(pauseVideo, 500);
+  setTimeout(() => {
+    const policy = getHardBlockPolicy();
+    if (policy) {
+      document.body.innerHTML = policy.createHTML(`<img src="${blockImg}" style="width: 100%; height: 100%">`);
+    } else {
+      document.body.innerHTML = `<img src="${blockImg}" style="width: 100%; height: 100%">`;
+    }
+    clearInterval(stopInt);
+  }, 3000)
+}
+
+function pauseVideo() {
+  const ea = document.getElementsByTagName('video');
+  if (ea.length == 0) { return; }
+  for (i in ea) {
+    if (typeof(ea[i].pause) !== 'function') { continue; }
+    console.debug('[LS Filter] paused ->', ea[i].paused);
+    if (!ea[i].paused) {
+      console.debug('[LS Filter] pause video');
+      ea[i].pause();
+    }
+    const e = ea[i].closest('ytd-channel-video-player-renderer');
+    if (e && e.style.display !== 'none') {
+      console.debug('[LS Filter] hide autoplay container');
+      e.style.display = 'none';
+    }
+  }
+}
+
+function onLoad() {
+  console.log('[LS Filter] loaded');
+  if (window.top === window.self) {
+    console.log('[LS Filter] top window: ' + window.location.href);
+    scoreUrl({ url: window.location.href }, false);
+  }
+}
+
+onLoad();
+
+
+
+</script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="artifact-type" content="narrative">
+  <meta name="design-style" content="briefing">
+  <title>Coaching the Small Group &amp; Individual Instruction Playbook — Early Literacy Essential #3</title>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: light;
+
+      /* 1. Briefing style tokens */
+      --background: #faf9f5;
+      --surface-container-low: #ffffff;
+      --surface-container: #f1efe8;
+      --surface-container-high: #e6e2d6;
+
+      --on-surface: #17181a;
+      --on-surface-variant: #56585c;
+
+      --outline: #17181a;
+      --outline-variant: #dedad0;
+
+      --primary: #17181a;
+      --on-primary: #faf9f5;
+      --primary-container: #f2b705;
+      --on-primary-container: #17181a;
+      --secondary: #1f4e5f;
+      --on-secondary: #faf9f5;
+      --secondary-container: #e3edf0;
+      --tertiary: #785008;
+      --error: #b42318;
+      --on-error: #ffffff;
+      --error-container: #fbeae8;
+
+      --data-1: #1f4e5f;
+      --data-2: #d99000;
+      --data-3: #2b6e52;
+      --data-4: #b84a39;
+      --data-context: #c4bfb2;
+
+      --chip-bg: #f5e6c4;
+      --button-border: #c8c4b8;
+
+      --font-headline: 'Source Serif 4', serif;
+      --font-body: 'Plus Jakarta Sans', sans-serif;
+      --font-label: 'Geist Mono', monospace;
+
+      --rounded: 0.25rem;
+      --rounded-lg: 0.375rem;
+      --rounded-full: 0.25rem;
+
+      --section-rule: 1.5px solid var(--outline);
+      --card-border: 1px solid var(--outline-variant);
+      --badge-radius: 2px;
+      --heading-tracking: -0.02em;
+      --label-tracking: 0.08em;
+
+      /* 3. Shared tokens */
+      --positive: #2b6e52;
+      --positive-container: #e4efe9;
+      --warning: #9a6700;
+      --warning-container: #f5e6c4;
+      --focus: #1f4e5f;
+
+      /* Narrative type scale */
+      --display-size: clamp(2.25rem, 1.4rem + 3.4vw, 3.75rem);
+      --headline-size: clamp(1.65rem, 1.2rem + 1.6vw, 2.35rem);
+      --subhead-size: clamp(1.1875rem, 1.05rem + 0.45vw, 1.4rem);
+      --body-size: clamp(1rem, 0.96rem + 0.2vw, 1.0625rem);
+      --label-size: clamp(0.75rem, 0.72rem + 0.12vw, 0.8125rem);
+
+      /* Spacing scale */
+      --space-2xs: 0.1875rem;
+      --space-xs: 0.25rem;
+      --space-sm: 0.5rem;
+      --space-md: 1rem;
+      --space-lg: 1.5rem;
+      --space-xl: 2.5rem;
+      --space-2xl: 4rem;
+      --space-3xl: 5.5rem;
+
+      /* Motion */
+      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+      --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+      --dur-micro: 120ms;
+      --dur-short: 220ms;
+      --dur-long: 420ms;
+    }
+
+    /* Base reset */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body {
+      overflow-x: clip;
+      margin: 0;
+      padding: 0;
+      background-color: var(--background);
+      color: var(--on-surface);
+      font-family: var(--font-body);
+      font-size: var(--body-size);
+      line-height: 1.62;
+      -webkit-font-smoothing: antialiased;
+    }
+    header { position: static !important; }
+
+    .page-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-2xl);
+      padding: var(--space-xl) var(--space-lg) var(--space-3xl);
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+    .page-grid * { min-width: 0; }
+
+    /* Focus visibility */
+    :focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    /* Typography */
+    h1, h2, h3, h4 {
+      font-family: var(--font-headline);
+      font-weight: 600;
+      letter-spacing: var(--heading-tracking);
+      color: var(--on-surface);
+      margin: 0;
+    }
+    p {
+      margin: 0 0 var(--space-md) 0;
+      max-width: 68ch;
+    }
+    p:last-child { margin-bottom: 0; }
+
+    /* Dossier Header & Section Bars */
+    .dossier-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-sm);
+      border-bottom: var(--section-rule);
+      padding-bottom: var(--space-sm);
+      margin-bottom: var(--space-lg);
+    }
+    .dossier-bar-left {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+    .dossier-pill {
+      background: var(--primary-container);
+      color: var(--on-primary-container);
+      font-family: var(--font-body);
+      font-weight: 700;
+      font-size: var(--label-size);
+      letter-spacing: var(--label-tracking);
+      text-transform: uppercase;
+      padding: var(--space-2xs) var(--space-sm);
+      border-radius: var(--badge-radius);
+      display: inline-block;
+    }
+    .dossier-meta {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      color: var(--on-surface-variant);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .hero-title {
+      font-size: var(--display-size);
+      line-height: 1.07;
+      margin-bottom: var(--space-md);
+      max-width: 24ch;
+    }
+    .standfirst {
+      font-family: var(--font-body);
+      font-size: var(--subhead-size);
+      font-weight: 600;
+      line-height: 1.42;
+      color: var(--secondary);
+      max-width: 62ch;
+      margin-bottom: var(--space-lg);
+    }
+
+    .hero-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+      gap: var(--space-xl);
+      align-items: start;
+    }
+
+    .aside-box {
+      background: var(--surface-container);
+      border-top: var(--section-rule);
+      padding: var(--space-lg);
+      border-radius: 0 0 var(--rounded-lg) var(--rounded-lg);
+    }
+    .aside-kicker {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: var(--label-tracking);
+      color: var(--secondary);
+      margin-bottom: var(--space-sm);
+    }
+
+    .mandate-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-md);
+      margin-top: var(--space-xl);
+    }
+    .figure-card {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      padding: var(--space-md) var(--space-lg);
+    }
+    .figure-card-label {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: var(--label-tracking);
+      color: var(--secondary);
+      margin-bottom: var(--space-xs);
+    }
+    .figure-card-title {
+      font-family: var(--font-headline);
+      font-size: var(--subhead-size);
+      font-weight: 600;
+      margin-bottom: var(--space-xs);
+    }
+    .figure-card p {
+      font-size: 0.9375rem;
+      color: var(--on-surface-variant);
+      line-height: 1.5;
+    }
+
+    /* Section Index Navigation */
+    .toc-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      padding: var(--space-md) 0;
+      border-top: var(--card-border);
+      border-bottom: var(--card-border);
+      margin-top: var(--space-lg);
+      align-items: center;
+    }
+    .toc-link {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      color: var(--on-surface);
+      text-decoration: none;
+      padding: var(--space-xs) var(--space-sm);
+      border: var(--card-border);
+      border-radius: var(--rounded);
+      background: var(--surface-container-low);
+      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out);
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xs);
+    }
+    .toc-link:hover {
+      background: var(--surface-container-high);
+      border-color: var(--outline);
+    }
+    .index-num {
+      font-family: var(--font-label);
+      font-weight: 600;
+      font-size: var(--label-size);
+      color: var(--secondary);
+    }
+
+    /* Section Headers */
+    .section-block {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-lg);
+    }
+    .section-heading {
+      font-size: var(--headline-size);
+      line-height: 1.15;
+    }
+    .section-deck {
+      font-weight: 600;
+      color: var(--secondary);
+      font-size: 1.0625rem;
+      max-width: 66ch;
+    }
+
+    /* Two-column editorial split */
+    .editorial-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+      gap: var(--space-xl);
+      align-items: start;
+    }
+    .equal-split {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-lg);
+      align-items: start;
+    }
+
+    /* Tables */
+    .table-wrap {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      overflow-x: auto;
+    }
+    table.briefing-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.9375rem;
+    }
+    table.briefing-table th {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: var(--space-md);
+      background: var(--surface-container);
+      border-bottom: var(--section-rule);
+      color: var(--on-surface);
+    }
+    table.briefing-table td {
+      padding: var(--space-md);
+      border-bottom: var(--card-border);
+      vertical-align: top;
+      line-height: 1.5;
+    }
+    table.briefing-table tr:last-child td {
+      border-bottom: none;
+    }
+    .tag-chip {
+      display: inline-block;
+      background: var(--chip-bg);
+      color: var(--tertiary);
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      padding: var(--space-2xs) var(--space-sm);
+      border-radius: var(--rounded);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .tag-chip--positive {
+      background: var(--positive-container);
+      color: var(--positive);
+    }
+    .tag-chip--error {
+      background: var(--error-container);
+      color: var(--error);
+    }
+    .tag-chip--secondary {
+      background: var(--secondary-container);
+      color: var(--secondary);
+    }
+
+    /* Buttons */
+    .btn {
+      font-family: var(--font-body);
+      font-weight: 600;
+      font-size: 0.9375rem;
+      padding: var(--space-sm) var(--space-md);
+      border-radius: var(--rounded);
+      cursor: pointer;
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-sm);
+      border: 1px solid var(--primary);
+      background: var(--primary);
+      color: var(--on-primary);
+      transition: background-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out);
+    }
+    .btn:hover {
+      background: var(--secondary);
+      border-color: var(--secondary);
+    }
+    .btn--secondary {
+      background: var(--surface-container-low);
+      color: var(--on-surface);
+      border: 1px solid var(--button-border);
+    }
+    .btn--secondary:hover {
+      background: var(--surface-container-high);
+      border-color: var(--outline);
+    }
+    .btn--active {
+      background: var(--secondary);
+      color: var(--on-secondary);
+      border-color: var(--secondary);
+    }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    /* Interactive Diagnostic Scenarios */
+    .interactive-panel {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      padding: var(--space-lg);
+    }
+    .panel-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--space-md);
+      padding-bottom: var(--space-md);
+      border-bottom: var(--card-border);
+      margin-bottom: var(--space-lg);
+    }
+    .scenario-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+    }
+    .scenario-btn {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      padding: var(--space-xs) var(--space-md);
+      min-height: 44px;
+      border: 1px solid var(--button-border);
+      border-radius: var(--rounded);
+      background: var(--background);
+      color: var(--on-surface);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xs);
+    }
+    .scenario-btn:hover {
+      background: var(--surface-container-high);
+    }
+    .scenario-btn.is-current {
+      background: var(--primary);
+      color: var(--on-primary);
+      border-color: var(--primary);
+    }
+    .scenario-btn.is-done {
+      border-color: var(--positive);
+    }
+    .scenario-quote {
+      font-family: var(--font-headline);
+      font-size: 1.25rem;
+      line-height: 1.45;
+      color: var(--on-surface);
+      background: var(--background);
+      border-left: 3px solid var(--primary-container);
+      padding: var(--space-md) var(--space-lg);
+      margin-bottom: var(--space-md);
+    }
+    .choice-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      margin-bottom: var(--space-md);
+    }
+    .feedback-box {
+      padding: var(--space-md) var(--space-lg);
+      border-radius: var(--rounded);
+      border: var(--card-border);
+      background: var(--surface-container);
+    }
+    .feedback-box--correct {
+      background: var(--positive-container);
+      border-color: var(--positive);
+    }
+    .feedback-box--alert {
+      background: var(--error-container);
+      border-color: var(--error);
+    }
+
+    /* Prohibited Practices list */
+    .law-callout {
+      background: var(--surface-container);
+      border-top: var(--section-rule);
+      border-left: 4px solid var(--error);
+      padding: var(--space-lg);
+      border-radius: 0 var(--rounded-lg) var(--rounded-lg) 0;
+    }
+    .law-list {
+      margin: var(--space-sm) 0 0 0;
+      padding-left: var(--space-lg);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    /* Adaptive Card Grids */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+      gap: var(--space-lg);
+    }
+    .card-grid--compact {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+      gap: var(--space-md);
+    }
+
+    /* IES Routine Selector */
+    .ies-tabs {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-sm);
+      margin-bottom: var(--space-lg);
+    }
+    .ies-tab {
+      text-align: left;
+      padding: var(--space-md);
+      background: var(--background);
+      border: 1px solid var(--outline-variant);
+      border-radius: var(--rounded);
+      cursor: pointer;
+      min-height: 44px;
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-xs);
+      color: var(--on-surface);
+      font-family: var(--font-body);
+    }
+    .ies-tab:hover {
+      background: var(--surface-container);
+    }
+    .ies-tab.is-active {
+      background: var(--secondary-container);
+      border-color: var(--secondary);
+      box-shadow: inset 0 3px 0 var(--secondary);
+    }
+    .ies-tab-title {
+      font-weight: 700;
+      font-size: 0.9375rem;
+    }
+    .script-bubble {
+      background: var(--background);
+      border: var(--card-border);
+      border-left: 3px solid var(--secondary);
+      padding: var(--space-md);
+      border-radius: var(--rounded);
+      font-style: italic;
+      margin-bottom: var(--space-sm);
+    }
+
+    /* GRR & 13 Elements */
+    .grr-svg-wrap {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      padding: var(--space-lg);
+    }
+    .phase-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      margin-bottom: var(--space-md);
+    }
+    .element-chip-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr));
+      gap: var(--space-sm);
+    }
+    .element-item {
+      padding: var(--space-sm) var(--space-md);
+      border: var(--card-border);
+      border-radius: var(--rounded);
+      background: var(--background);
+      font-size: 0.9375rem;
+      display: flex;
+      gap: var(--space-sm);
+      align-items: flex-start;
+      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out);
+    }
+    .element-item.is-highlighted {
+      background: var(--warning-container);
+      border-color: var(--tertiary);
+    }
+
+    /* Bullet 1-5 Look-Fors Navigator & Checklist */
+    .bullet-selector {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: var(--space-sm);
+    }
+    .bullet-btn {
+      text-align: left;
+      padding: var(--space-md);
+      border: 1px solid var(--outline-variant);
+      border-radius: var(--rounded);
+      background: var(--surface-container-low);
+      cursor: pointer;
+      min-height: 44px;
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-xs);
+      font-family: var(--font-body);
+      color: var(--on-surface);
+    }
+    .bullet-btn:hover {
+      background: var(--surface-container);
+    }
+    .bullet-btn.is-active {
+      background: var(--primary);
+      color: var(--on-primary);
+      border-color: var(--primary);
+    }
+    .bullet-btn.is-active .index-num {
+      color: var(--primary-container);
+    }
+
+    .lookfor-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-md);
+    }
+    .lookfor-col {
+      background: var(--background);
+      border: var(--card-border);
+      border-radius: var(--rounded);
+      padding: var(--space-md);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+    .check-item {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-sm);
+      font-size: 0.9375rem;
+      line-height: 1.45;
+      cursor: pointer;
+      padding: var(--space-xs);
+      border-radius: var(--rounded);
+    }
+    .check-item:hover {
+      background: var(--surface-container);
+    }
+    .check-item input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin-top: 2px;
+      accent-color: var(--secondary);
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+
+    /* Domain Matrix */
+    .domain-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      margin-bottom: var(--space-md);
+    }
+
+    /* Classroom Peek Case Studies */
+    .case-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-lg);
+    }
+    .case-card {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      padding: var(--space-lg);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+    .case-meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--space-sm);
+      flex-wrap: wrap;
+    }
+
+    /* Common Curiosities */
+    .curiosity-item {
+      background: var(--surface-container-low);
+      border: var(--card-border);
+      border-radius: var(--rounded-lg);
+      overflow: hidden;
+    }
+    .curiosity-trigger {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: none;
+      padding: var(--space-md) var(--space-lg);
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--space-md);
+      font-family: var(--font-headline);
+      font-size: 1.125rem;
+      font-weight: 600;
+      color: var(--on-surface);
+      min-height: 52px;
+    }
+    .curiosity-trigger:hover {
+      background: var(--surface-container);
+    }
+    .curiosity-body {
+      padding: 0 var(--space-lg) var(--space-lg);
+      border-top: var(--card-border);
+      background: var(--background);
+      padding-top: var(--space-md);
+    }
+    .curiosity-body[hidden] {
+      display: none;
+    }
+
+    /* Coach PL Planner Form Controls */
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-xs);
+    }
+    .form-label {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: var(--label-tracking);
+      color: var(--on-surface);
+    }
+    .form-select, .form-textarea, .form-input {
+      font-family: var(--font-body);
+      font-size: 0.9375rem;
+      color: var(--on-surface);
+      background: var(--surface-container-low);
+      border: 1px solid var(--button-border);
+      border-radius: var(--rounded);
+      padding: var(--space-sm) var(--space-md);
+      min-height: 44px;
+      width: 100%;
+    }
+    .form-select {
+      padding-right: var(--space-xl);
+    }
+    .form-textarea {
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+    .form-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-md);
+      align-items: end;
+    }
+    .status-banner {
+      font-family: var(--font-label);
+      font-size: var(--label-size);
+      padding: var(--space-sm) var(--space-md);
+      border-radius: var(--rounded);
+      background: var(--positive-container);
+      color: var(--positive);
+      display: inline-block;
+    }
+    .status-banner[hidden] {
+      display: none;
+    }
+
+    /* Footer */
+    .site-footer {
+      border-top: var(--section-rule);
+      padding-top: var(--space-xl);
+      color: var(--on-surface-variant);
+      font-size: 0.875rem;
+    }
+    .citation-list {
+      columns: 2;
+      column-gap: var(--space-xl);
+      padding-left: var(--space-md);
+      margin: var(--space-md) 0;
+    }
+    .citation-list li {
+      break-inside: avoid;
+      margin-bottom: var(--space-sm);
+    }
+
+    /* Responsive adjustments */
+    @media (max-width: 900px) {
+      .hero-split,
+      .editorial-split,
+      .equal-split,
+      .lookfor-grid,
+      .case-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .ies-tabs {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .bullet-selector {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .citation-list {
+        columns: 1;
+      }
+    }
+    @media (max-width: 640px) {
+      .page-grid {
+        padding: var(--space-md);
+        gap: var(--space-xl);
+      }
+      .mandate-strip,
+      .ies-tabs,
+      .bullet-selector {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page-grid">
+
+    <!-- OPENING DOSSIER HEADER -->
+    <header id="top">
+      <div class="dossier-bar">
+        <div class="dossier-bar-left">
+          <span class="dossier-pill">Coaching Field Dossier</span>
+          <span class="dossier-meta">Early Literacy K–3 · Essential Instructional Practice #3</span>
+        </div>
+        <span class="dossier-meta" id="walkthrough-counter">Walkthrough Log: 0 / 15 Look-Fors Verified</span>
+      </div>
+
+      <div class="hero-split">
+        <div>
+          <h1 class="hero-title">Deconstructing the Small Group &amp; Individual Instruction Playbook</h1>
+          <p class="standfirst">An instructional coach’s breakdown of MAISA / GELN Essential Practice #3—translating flexible, code-emphasized, meaning-centered literacy instruction into classroom look-fors and collaborative teacher debriefs.</p>
+          <p>Whole-group Tier I instruction establishes shared grade-level concepts, yet research demonstrates it cannot meet every reader’s and writer’s needs on its own. Small group and individual instruction bridges that gap only when groups are formed around <strong>observed and assessed literacy needs</strong>—never perceived general ability or static book levels.</p>
+        </div>
+
+        <aside class="aside-box" aria-label="Playbook Architecture Summary">
+          <div class="aside-kicker">Coaching North Star</div>
+          <p><strong>Essential #3 × Essential #9:</strong> Coaching starts with diagnostic and formative assessment data, connects directly to Tier I standards and district-approved high-quality instructional materials (PA 146), and anchors every group in <strong>meaning-making</strong>.</p>
+          <p style="font-size: 0.9375rem; color: var(--on-surface-variant);">Informed by the Michigan Dyslexia Handbook (Ch. 4: <em>The Reading Brain</em>, <em>Simple View of Reading</em>, <em>Reading Learning Progression</em>) and LETRS data-driven differentiation.</p>
+        </aside>
+      </div>
+
+      <div class="mandate-strip">
+        <article class="figure-card">
+          <div class="figure-card-label">01 · Equity Scope</div>
+          <h2 class="figure-card-title">Every Child</h2>
+          <p>Receives targeted, explicit instruction during small group or individualized sessions based on observed and assessed literacy needs.</p>
+        </article>
+        <article class="figure-card">
+          <div class="figure-card-label">02 · Infrastructure</div>
+          <h2 class="figure-card-title">Every Classroom</h2>
+          <p>Dedicates the time, behavioral routines, and assessment structures required to deliver research-aligned differentiated instruction.</p>
+        </article>
+        <article class="figure-card">
+          <div class="figure-card-label">03 · Cadence</div>
+          <h2 class="figure-card-title">Every Day</h2>
+          <p>Provides intentional small group or individual coaching that prioritizes active reading, writing, and fluency over busywork.</p>
+        </article>
+      </div>
+
+      <nav class="toc-strip" aria-label="Dossier Sections">
+        <a class="toc-link" href="#sec-shift"><span class="index-num">01</span> What It Is vs. Isn’t</a>
+        <a class="toc-link" href="#sec-centers"><span class="index-num">02</span> Centers &amp; Routines</a>
+        <a class="toc-link" href="#sec-explicit"><span class="index-num">03</span> Explicit Instruction &amp; GRR</a>
+        <a class="toc-link" href="#sec-bullets"><span class="index-num">04</span> 5 Bullets &amp; Look-Fors</a>
+        <a class="toc-link" href="#sec-grouping"><span class="index-num">05</span> SSI &amp; Classroom Peeks</a>
+        <a class="toc-link" href="#sec-pl"><span class="index-num">06</span> PL Facilitation &amp; Curiosities</a>
+      </nav>
+    </header>
+
+    <!-- SECTION 01: WHAT IT IS VS WHAT IT ISN'T + LEGAL GUARDRAILS + DIAGNOSTIC -->
+    <section id="sec-shift" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 01</span>
+            <span class="dossier-meta">Core Shift &amp; Legal Guardrails</span>
+          </div>
+          <span class="dossier-meta">Research Anchor: Connor et al. (2011)</span>
+        </div>
+        <h2 class="section-heading">Flexible Skill Groups Replace Permanent Reading Levels</h2>
+        <p class="section-deck">Connor et al. (2011) established that classrooms delivering differentiated small-group instruction consistently outperform those relying solely on whole-group teaching—especially for learners not yet performing at grade level.</p>
+      </div>
+
+      <div class="editorial-split">
+        <div class="table-wrap">
+          <table class="briefing-table">
+            <thead>
+              <tr>
+                <th style="width: 50%;">What Essential #3 Is (Teacher-Led)</th>
+                <th style="width: 50%;">What Essential #3 Isn’t</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>A component of <strong>Tier I instruction for all students</strong>.</td>
+                <td>Reserved exclusively for Tier II and Tier III intervention.</td>
+              </tr>
+              <tr>
+                <td><strong>Flexible groups</strong> that are frequently adjusted as skills shift.</td>
+                <td>Long-term, static, or permanent ability groups.</td>
+              </tr>
+              <tr>
+                <td>Grouped by identified <strong>assets, skills, standards-based needs, and interests</strong>.</td>
+                <td>Grouped by a book level (e.g., “Level J Group”).</td>
+              </tr>
+              <tr>
+                <td>Connected to <strong>ELA standards</strong> or reinforcing/reteaching Tier I whole-group lessons.</td>
+                <td>Isolated instruction disconnected from Tier I or Tier II core work.</td>
+              </tr>
+              <tr>
+                <td><strong>Targeted instruction</strong> tailored to shared group or individual needs.</td>
+                <td>Repeating the exact same lesson to every small group in rotation.</td>
+              </tr>
+              <tr>
+                <td><strong>Direct, explicit instruction</strong> with modeling and responsive feedback.</td>
+                <td>Uninstructed practice time or passive check-ins.</td>
+              </tr>
+              <tr>
+                <td>Majority of minutes spent <strong>reading, writing, and discussing text</strong>.</td>
+                <td>Majority of teacher-led time spent on games, worksheets, or teacher talk.</td>
+              </tr>
+              <tr>
+                <td>Integrates a <strong>meaning-making or comprehension component</strong>.</td>
+                <td>Isolated word reading divorced from purpose or meaning.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="law-callout" aria-label="Michigan K-12 Literacy and Dyslexia Law Guardrails">
+          <div class="aside-kicker" style="color: var(--error);">Code-Emphasis Mandate (MI Dyslexia Law)</div>
+          <p>Instructional methods must use a <strong>code-emphasis approach</strong>: direct, explicit instruction on written English at the sound, syllable, morpheme, and word level to build accurate sound-symbol automaticity.</p>
+          <p style="font-size: 0.9375rem; font-weight: 600;">Teachers must NOT use these 5 decoding practices <span style="font-weight: 400;">(unless confirming meaning <em>after</em> decoding has been attempted)</span>:</p>
+          <ol class="law-list" style="font-size: 0.9375rem;">
+            <li>Prompting pupils to guess unknown words using pictures and illustrations.</li>
+            <li>Skipping over an unknown word to use passage meaning to recognize it.</li>
+            <li>Identifying only the first sound and guessing from initial sound plus context.</li>
+            <li>Memorizing a word solely in its whole written form.</li>
+            <li>Using predictable or leveled text for initial word recognition instruction and letter-sound practice.</li>
+          </ol>
+        </aside>
+      </div>
+
+      <!-- INTERACTIVE 1: Walkthrough Misconception Diagnostic -->
+      <div class="interactive-panel" aria-label="Walkthrough Alignment Diagnostic">
+        <div class="panel-header">
+          <div>
+            <div class="figure-card-label">Coaching Practice Tool · Walkthrough Calibration</div>
+            <h3 style="font-size: var(--subhead-size);">Test Your Coaching Lens: Aligned Practice or Playbook Red Flag?</h3>
+          </div>
+          <div class="scenario-nav" id="diag-nav"></div>
+        </div>
+
+        <div id="diag-stage">
+          <div class="dossier-meta" id="diag-counter" style="margin-bottom: var(--space-xs);">Scenario 1 of 5</div>
+          <blockquote class="scenario-quote" id="diag-quote"></blockquote>
+          <div class="choice-row">
+            <button type="button" class="btn" id="btn-aligned" onclick="submitDiagnostic('aligned')">Aligned with Essential #3</button>
+            <button type="button" class="btn btn--secondary" id="btn-redflag" onclick="submitDiagnostic('redflag')">Playbook Red Flag</button>
+          </div>
+          <div id="diag-feedback" aria-live="polite"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 02: CENTERS & BEHAVIORAL ROUTINES -->
+    <section id="sec-centers" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 02</span>
+            <span class="dossier-meta">Classroom Ecosystem &amp; Independence</span>
+          </div>
+          <span class="dossier-meta">Source: IES Behavioral Interventions Guide &amp; Wright / Tortorelli (2024)</span>
+        </div>
+        <h2 class="section-heading">What the Rest of the Class Does Protects the Small Group Table</h2>
+        <p class="section-deck">Teachers can only coach uninterrupted when early-year procedures, clear transition signals, and meaningful independent literacy tasks allow the rest of the room to run smoothly.</p>
+      </div>
+
+      <div class="card-grid">
+        <article class="figure-card">
+          <div class="figure-card-label">Independent Literacy Task</div>
+          <h3 class="figure-card-title">Repeated &amp; Dyad Reading</h3>
+          <p>Students reread texts they can decode independently with changing purposes (character traits, summarizing, highlighting letter-sounds), or read side-by-side in dyads and partner collaborations.</p>
+        </article>
+        <article class="figure-card">
+          <div class="figure-card-label">Independent Literacy Task</div>
+          <h3 class="figure-card-title">Writing &amp; Brief Handwriting</h3>
+          <p>Writing in response to reading, making predictions, gathering content-area information, explaining steps, collaborating on peer writing, and brief targeted handwriting practice.</p>
+        </article>
+        <article class="figure-card">
+          <div class="figure-card-label">Independent Literacy Task</div>
+          <h3 class="figure-card-title">Applied Skills &amp; Technology</h3>
+          <p>FCRR Student Center Activities (word sorts, word hunts, blending/segmenting, multisyllabic practice, reader’s theater, book clubs), audiobook read-alongs, and research-proven adaptive software.</p>
+        </article>
+      </div>
+
+      <div class="aside-box">
+        <div class="aside-kicker">Three Structures for Moving Independently Through Centers</div>
+        <div class="card-grid--compact">
+          <div>
+            <strong>1. Rotation</strong>
+            <p style="font-size: 0.9375rem;">All children move through all designated literacy centers on a predictable chime or visual schedule.</p>
+          </div>
+          <div>
+            <strong>2. Choice</strong>
+            <p style="font-size: 0.9375rem;">Students select which literacy centers to complete, increasing agency and ownership of independent practice.</p>
+          </div>
+          <div>
+            <strong>3. Must Do &amp; May Do</strong>
+            <p style="font-size: 0.9375rem;">Children complete required core literacy tasks first (“Must Do”), then choose among enrichment options (“May Do”).</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- INTERACTIVE 2: IES 4 Recommendations Script Explorer -->
+      <div class="interactive-panel" aria-label="IES Behavioral Routines Explorer">
+        <div class="panel-header">
+          <div>
+            <div class="figure-card-label">Coaching Support · Setting Up Systems</div>
+            <h3 style="font-size: var(--subhead-size);">IES Guide: 4 Behavioral Foundations for Small-Group Independence</h3>
+          </div>
+          <span class="dossier-meta">Select a recommendation to inspect look-fors &amp; teacher scripts</span>
+        </div>
+
+        <div class="ies-tabs" id="ies-tabs"></div>
+        <div id="ies-detail" class="equal-split"></div>
+      </div>
+    </section>
+
+    <!-- SECTION 03: EXPLICIT INSTRUCTION & GRADUAL RELEASE -->
+    <section id="sec-explicit" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 03</span>
+            <span class="dossier-meta">Instructional Delivery Engine</span>
+          </div>
+          <span class="dossier-meta">PA 146 (2024) · Archer &amp; Hughes (2011) · Duke et al. (2011)</span>
+        </div>
+        <h2 class="section-heading">Explicit Instruction &amp; the Gradual Release of Responsibility</h2>
+        <p class="section-deck">Under Michigan Public Act 146, explicit instruction is direct, deliberate, and built on continuous teacher-pupil interaction—combining clear explanation, modeling, multiple practice rounds with immediate feedback, distributive practice, and cumulative review.</p>
+      </div>
+
+      <div class="grr-svg-wrap">
+        <div class="panel-header" style="margin-bottom: var(--space-md);">
+          <div>
+            <div class="figure-card-label">Interactive Schematic · Select an Instructional Phase</div>
+            <h3 style="font-size: var(--subhead-size);">How the 13 Key Elements Map Across Gradual Release</h3>
+          </div>
+          <div class="phase-pills" id="grr-phase-pills"></div>
+        </div>
+
+        <!-- Annotated Inline SVG Schematic of GRR -->
+        <svg viewBox="0 0 860 210" width="100%" role="img" aria-label="Gradual Release of Responsibility diagram showing Teacher Responsibility decreasing from I Do to You Do as Student Responsibility increases" style="display: block; max-width: 100%; height: auto; margin-bottom: var(--space-lg);">
+          <rect x="0" y="0" width="860" height="210" fill="var(--background)" rx="4" />
+          <!-- Diagonal split polygons -->
+          <polygon points="20,24 840,24 840,68 20,166" fill="var(--data-1)" opacity="0.16" />
+          <polygon points="20,166 840,68 840,186 20,186" fill="var(--data-2)" opacity="0.22" />
+          <line x1="20" y1="166" x2="840" y2="68" stroke="var(--data-1)" stroke-width="2.5" />
+          <!-- Phase vertical dividers -->
+          <line x1="225" y1="24" x2="225" y2="186" stroke="var(--outline-variant)" stroke-width="1.5" stroke-dasharray="4 4" />
+          <line x1="430" y1="24" x2="430" y2="186" stroke="var(--outline-variant)" stroke-width="1.5" stroke-dasharray="4 4" />
+          <line x1="635" y1="24" x2="635" y2="186" stroke="var(--outline-variant)" stroke-width="1.5" stroke-dasharray="4 4" />
+          <!-- Active highlight overlay (moved via JS) -->
+          <rect id="grr-highlight-rect" x="20" y="24" width="205" height="162" fill="none" stroke="var(--primary)" stroke-width="2.5" rx="2" />
+          <!-- Role Labels -->
+          <text x="34" y="46" font-family="Geist Mono, monospace" font-size="11" font-weight="600" fill="var(--data-1)">TEACHER RESPONSIBILITY (MODELING &amp; SCAFFOLDING)</text>
+          <text x="530" y="172" font-family="Geist Mono, monospace" font-size="11" font-weight="600" fill="var(--tertiary)">STUDENT RESPONSIBILITY (APPLICATION)</text>
+          <!-- Phase Labels -->
+          <text x="122" y="102" text-anchor="middle" font-family="Source Serif 4, serif" font-size="17" font-weight="600" fill="var(--on-surface)">1. Launch &amp; I Do</text>
+          <text x="122" y="122" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" fill="var(--on-surface-variant)">Goals, Review &amp; Modeling</text>
+
+          <text x="327" y="102" text-anchor="middle" font-family="Source Serif 4, serif" font-size="17" font-weight="600" fill="var(--on-surface)">2. We Do</text>
+          <text x="327" y="122" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" fill="var(--on-surface-variant)">Guided &amp; Collaborative Practice</text>
+
+          <text x="532" y="102" text-anchor="middle" font-family="Source Serif 4, serif" font-size="17" font-weight="600" fill="var(--on-surface)">3. Check &amp; Coach</text>
+          <text x="532" y="122" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" fill="var(--on-surface-variant)">Brisk Pace &amp; Immediate Feedback</text>
+
+          <text x="737" y="102" text-anchor="middle" font-family="Source Serif 4, serif" font-size="17" font-weight="600" fill="var(--on-surface)">4. You Do</text>
+          <text x="737" y="122" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" fill="var(--on-surface-variant)">Judicious Independent Practice</text>
+        </svg>
+
+        <div id="grr-phase-summary" class="aside-box" style="margin-bottom: var(--space-md);"></div>
+        <div class="element-chip-list" id="elements-13-grid"></div>
+      </div>
+
+      <div class="lookfor-grid" aria-label="Explicit Instruction Look-Fors">
+        <div class="lookfor-col">
+          <div class="figure-card-label">Look For · Teacher</div>
+          <ul style="margin: 0; padding-left: var(--space-md); font-size: 0.9375rem;">
+            <li>Reviews prior content via retrieval practice.</li>
+            <li>Delivers clear explanations of critical content and goals.</li>
+            <li>Sequences instruction into understandable chunks.</li>
+            <li>Maintains an opening, body, conclusion at a brisk pace.</li>
+            <li>Elicits frequent student responses and releases responsibility (I Do, We Do, You Do).</li>
+            <li>Gives specific, informative feedback while monitoring closely.</li>
+          </ul>
+        </div>
+        <div class="lookfor-col">
+          <div class="figure-card-label">Look For · Children</div>
+          <ul style="margin: 0; padding-left: var(--space-md); font-size: 0.9375rem;">
+            <li>Articulate <em>what</em> they are learning, <em>why</em>, and <em>how</em> they will know they learned it.</li>
+            <li>Respond continuously through verbal, nonverbal, and written modes.</li>
+            <li>Active participation: no opt-out.</li>
+            <li>Work collaboratively and in partnerships.</li>
+            <li>Engage in deliberate, spaced practice and act on immediate feedback.</li>
+          </ul>
+        </div>
+        <div class="lookfor-col">
+          <div class="figure-card-label">Look For · Environment</div>
+          <ul style="margin: 0; padding-left: var(--space-md); font-size: 0.9375rem;">
+            <li>Desks/tables arranged so students face the teacher and can pair up easily.</li>
+            <li>Immediate access to whiteboards, markers, and instructional tools.</li>
+            <li>Behavioral and instructional routines visibly established.</li>
+            <li>Goals and expectations pre-corrected and continuously monitored.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 04: THE 5 PLAYBOOK BULLETS & INTERACTIVE LOOK-FOR CHECKLIST -->
+    <section id="sec-bullets" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 04</span>
+            <span class="dossier-meta">Classroom Observation &amp; Coaching Lens</span>
+          </div>
+          <span class="dossier-meta">Essential #3 · Five Core Bullets</span>
+        </div>
+        <h2 class="section-heading">Inside the Five Playbook Bullets: Look-Fors &amp; Equity</h2>
+        <p class="section-deck">Select any bullet below to inspect classroom indicators for Teachers, Children, and the Environment, explore its embedded instructional routines, and log verified observations during a coaching walkthrough.</p>
+      </div>
+
+      <!-- Equity & Minute Allocation Visual -->
+      <div class="editorial-split">
+        <div class="grr-svg-wrap">
+          <div class="figure-card-label">Bullet 1 &amp; Bullet 5 · Minute Allocation Lens</div>
+          <h3 style="font-size: var(--subhead-size); margin-bottom: var(--space-sm);">Where Do Small-Group Minutes Actually Go?</h3>
+          <p style="font-size: 0.9375rem; color: var(--on-surface-variant); margin-bottom: var(--space-md);">Coaches observe how students spend their minutes at the small-group table—guarding against lengthy picture walks, excessive teacher talk, and low-value skill-and-drill worksheets.</p>
+          <svg viewBox="0 0 540 138" width="100%" role="img" aria-label="Comparison bar diagram contrasting Playbook Essential 3 target time in connected reading and writing versus low-impact skill-and-drill sessions" style="display: block; max-width: 100%; height: auto;">
+            <text x="0" y="18" font-family="Geist Mono, monospace" font-size="11" font-weight="600" fill="var(--secondary)">PLAYBOOK TARGET (ESSENTIAL #3)</text>
+            <rect x="0" y="26" width="350" height="28" fill="var(--data-1)" rx="2" />
+            <text x="10" y="44" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="600" fill="var(--on-primary)">Active Reading, Writing &amp; Text Discussion</text>
+            <rect x="354" y="26" width="120" height="28" fill="var(--data-2)" rx="2" />
+            <text x="362" y="44" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="600" fill="var(--on-primary-container)">Explicit Model</text>
+            <rect x="478" y="26" width="62" height="28" fill="var(--data-3)" rx="2" />
+            <text x="485" y="44" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="600" fill="var(--on-primary)">Setup</text>
+
+            <text x="0" y="84" font-family="Geist Mono, monospace" font-size="11" font-weight="600" fill="var(--error)">COMMON EQUITY TRAP (AVOID)</text>
+            <rect x="0" y="92" width="180" height="28" fill="var(--data-4)" rx="2" />
+            <text x="10" y="110" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="600" fill="var(--on-primary)">Teacher Talk / Picture Walk</text>
+            <rect x="184" y="92" width="220" height="28" fill="var(--data-context)" rx="2" />
+            <text x="194" y="110" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="600" fill="var(--on-surface)">Worksheets, Games &amp; Isolated Drill</text>
+            <rect x="408" y="92" width="132" height="28" fill="var(--data-1)" opacity="0.55" rx="2" />
+            <text x="416" y="110" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="600" fill="var(--on-primary)">Brief Reading</text>
+          </svg>
+        </div>
+
+        <aside class="aside-box">
+          <div class="aside-kicker" style="color: var(--error);">The Bullet 5 Equity Imperative</div>
+          <p><strong>“The children who need the best instruction often get the least.”</strong> Research warns that the lowest-performing groups are frequently subjected to skill-and-drill worksheets, isolated word calling, and significantly less actual reading.</p>
+          <p style="font-size: 0.9375rem; color: var(--on-surface-variant);">Coaches must verify that <em>every</em> group experiences rich text, rigorous thinking, and meaning-making as the ultimate goal—never reserving comprehension solely for higher-performing readers.</p>
+        </aside>
+      </div>
+
+      <!-- Bullet Selector & Persistent Walkthrough Checklist -->
+      <div class="interactive-panel" aria-label="Five Bullets Look-For Explorer and Checklist">
+        <div class="panel-header">
+          <div>
+            <div class="figure-card-label">Interactive Walkthrough Breakdown</div>
+            <h3 style="font-size: var(--subhead-size);">Explore Bullets 1–5 &amp; Verify Classroom Look-Fors</h3>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: var(--space-sm); align-items: center;">
+            <span class="tag-chip tag-chip--secondary" id="checklist-badge">0 / 15 Checked</span>
+            <button type="button" class="btn btn--secondary" id="reset-checks-btn" onclick="handleResetChecks(this)">Reset Checklist</button>
+          </div>
+        </div>
+
+        <div class="bullet-selector" id="bullet-selector"></div>
+        <div id="bullet-detail-mount" style="margin-top: var(--space-lg);"></div>
+      </div>
+
+      <!-- Bullet 4 5-Domain Matrix -->
+      <div class="interactive-panel" aria-label="Bullet 4 Five Instructional Domains">
+        <div class="panel-header">
+          <div>
+            <div class="figure-card-label">Bullet 4 Deep Dive · Explicit Instruction Domains</div>
+            <h3 style="font-size: var(--subhead-size);">Five Literacy Domains &amp; Comprehension Routines</h3>
+          </div>
+          <span class="dossier-meta">Select a domain to inspect Look-Fors &amp; Coaching Strategies</span>
+        </div>
+
+        <div class="domain-pills" id="domain-pills"></div>
+        <div id="domain-detail-mount"></div>
+      </div>
+    </section>
+
+    <!-- SECTION 05: DATA-DRIVEN FLEXIBLE GROUPING & A PEEK IN THE CLASSROOM -->
+    <section id="sec-grouping" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 05</span>
+            <span class="dossier-meta">Data-Driven Grouping &amp; Lesson Design</span>
+          </div>
+          <span class="dossier-meta">SSI Planning · Classroom Case Studies</span>
+        </div>
+        <h2 class="section-heading">Plan With “SSI” &amp; Analyze Real Small-Group Pivots</h2>
+        <p class="section-deck">Purposeful small groups follow strong Tier I whole-group instruction to reinforce core concepts, pre-teach complex material, or extend understanding—planned intentionally through Standards, Students, and Instruction (SSI).</p>
+      </div>
+
+      <div class="mandate-strip" style="margin-top: 0;">
+        <article class="figure-card" style="border-top: 3px solid var(--data-1);">
+          <div class="figure-card-label">S · Step 1</div>
+          <h3 class="figure-card-title">Standards</h3>
+          <p>Which grade-level ELA standards, foundational phonics progressions, or text-structure expectations anchor this group’s teaching point?</p>
+        </article>
+        <article class="figure-card" style="border-top: 3px solid var(--data-2);">
+          <div class="figure-card-label">S · Step 2</div>
+          <h3 class="figure-card-title">Students</h3>
+          <p>What do diagnostic, unit, writing, and observational data reveal about this subset of students’ assets, shared breakdowns, and interests?</p>
+        </article>
+        <article class="figure-card" style="border-top: 3px solid var(--data-3);">
+          <div class="figure-card-label">I · Step 3</div>
+          <h3 class="figure-card-title">Instruction</h3>
+          <p>Which explicit routine, connected text, and scaffolded coaching prompt will close that specific breakdown while keeping meaning central?</p>
+        </article>
+      </div>
+
+      <div class="case-grid" id="classroom-cases-grid"></div>
+    </section>
+
+    <!-- SECTION 06: COMMON CURIOSITIES & PL FACILITATION WORKSPACE -->
+    <section id="sec-pl" class="section-block">
+      <div>
+        <div class="dossier-bar">
+          <div class="dossier-bar-left">
+            <span class="dossier-pill">Section 06</span>
+            <span class="dossier-meta">Professional Learning Facilitation</span>
+          </div>
+          <span class="dossier-meta">Guest Researcher: Dr. Nell K. Duke (University of Michigan)</span>
+        </div>
+        <h2 class="section-heading">Addressing Common Curiosities &amp; Leading Teacher Debriefs</h2>
+        <p class="section-deck">Use Dr. Nell K. Duke’s playbook responses to resolve recurring teacher questions during grade-level PLCs, then prepare a structured coaching conversation below.</p>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: var(--space-sm);" id="curiosities-list"></div>
+
+      <!-- Coach PL Conversation & Debrief Builder -->
+      <div class="interactive-panel" aria-label="Professional Learning Facilitation Workspace">
+        <div class="panel-header">
+          <div>
+            <div class="figure-card-label">Coach Facilitation Tool · Persistent Workspace</div>
+            <h3 style="font-size: var(--subhead-size);">Build a Grade-Level PL or Coaching Debrief Agenda</h3>
+          </div>
+          <span class="status-banner" id="save-status" hidden>Saved to notebook workspace</span>
+        </div>
+
+        <div class="editorial-split">
+          <div style="display: flex; flex-direction: column; gap: var(--space-md);">
+            <div class="form-field">
+              <label class="form-label" for="pl-topic-select">1. Select Coaching Conversation Focus</label>
+              <select class="form-select" id="pl-topic-select" onchange="selectPlTopic(this.value)"></select>
+            </div>
+
+            <div class="form-field">
+              <label class="form-label" for="coach-teacher-input">2. Teacher / Grade-Level Team Context (Optional)</label>
+              <input type="text" class="form-input" id="coach-teacher-input" placeholder="e.g., 2nd Grade Team · Post-Unit 3 Writing &amp; Fluency Check" oninput="updateCoachNotes()">
+            </div>
+
+            <div class="form-field">
+              <label class="form-label" for="coach-notes-input">3. Observation Notes &amp; Next-Step Commitments</label>
+              <textarea class="form-textarea" id="coach-notes-input" placeholder="Record specific strengths noticed, student data patterns, and the shared 1-week coaching action step..." oninput="updateCoachNotes()"></textarea>
+            </div>
+
+            <div class="form-row">
+              <button type="button" class="btn" onclick="exportCoachingBrief()">Export Coaching Brief (.txt)</button>
+              <button type="button" class="btn btn--secondary" id="clear-notes-btn" onclick="handleClearNotes(this)">Clear Notes</button>
+            </div>
+            <div id="export-feedback" aria-live="polite" style="font-size: 0.875rem; color: var(--secondary);"></div>
+          </div>
+
+          <aside class="aside-box" id="pl-protocol-card" aria-live="polite"></aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- FOOTER: SOURCES & CONTRIBUTORS -->
+    <footer class="site-footer">
+      <div class="dossier-bar">
+        <div class="dossier-bar-left">
+          <span class="dossier-pill">Reference Index</span>
+          <span class="dossier-meta">Playbook Sources &amp; Research Base</span>
+        </div>
+        <span class="dossier-meta">MAISA / GELN Early Literacy Essential #3</span>
+      </div>
+      <p>Synthesized for instructional coaches from the <em>Essential Instructional Practices in Early Literacy: Grades K to 3 — Small Group and Individual Instruction Playbook</em> (Key contributors: Melissa Marie, Geanice Miller, Heather Phelps, Sara TePastte, and Melissa Wing; Guest Literacy Researcher: Dr. Nell K. Duke).</p>
+      <ul class="citation-list">
+        <li>Archer, A. L., &amp; Hughes, C. A. (2011). <em>Explicit instruction: Effective and efficient teaching.</em></li>
+        <li>Connor, C. M., Morrison, F. J., Schatschneider, C., et al. (2011). Effective classroom instruction and small-group differentiation.</li>
+        <li>Domke, L. M., Kaplan, M., &amp; Bingham, G. E. (2024). Differentiated reading groups: Bridging literacy instruction and culturally sustaining pedagogy. <em>The Reading Teacher, 77</em>(6), 800–809.</li>
+        <li>Duke, N. K., &amp; Goldenberg, C. (2025). Yes, small-group reading instruction works. But use it wisely. <em>Education Week.</em></li>
+        <li>Duke, N. K., Pearson, P. D., Strachan, S. L., &amp; Billman, A. K. (2011). Essential elements of fostering and teaching reading comprehension; Pearson, P. D., &amp; Gallagher, M. C. (1983). Gradual Release Model.</li>
+        <li>Duke, N. K., &amp; Varlas, L. (2022). Turn small reading groups into big wins. <em>ASCD.</em></li>
+        <li>Florida Center for Reading Research (FCRR). <em>Teacher Resource Guide &amp; Student Center Activities</em> (<code>fcrr.org</code>).</li>
+        <li>Foorman, B., et al. (2016). <em>Foundational skills to support reading for understanding in kindergarten through 3rd grade</em> (IES NCEE 2016-4008).</li>
+        <li>Kuhn, M. R. (2020). Whole class or small group fluency instruction: A tutorial of four effective approaches. <em>Education Sciences, 10</em>(5), 145.</li>
+        <li>Lane, K. L., et al. (2024). <em>Teacher-Delivered Behavioral Interventions in Grades K–5</em> (IES WWC 2025001).</li>
+        <li>Michigan Department of Education (2022). <em>Michigan Dyslexia Handbook: Chapter 4 Reading Science</em> &amp; Public Act 146 (2024); EduPaths K–3 Modules (<code>literacyessentials.org</code>); Lexia LETRS Professional Learning; International Literacy Association Glossary.</li>
+        <li>Shanahan, T., Callison, K., Carriere, C., Duke, N. K., Pearson, P. D., Schatschneider, C., &amp; Torgesen, J. (2010). <em>Improving reading comprehension in kindergarten through 3rd grade</em> (IES NCEE 2010-4038).</li>
+        <li>Smith, K. C., Amendum, S. J., &amp; Williams, T. W. (2022). Maximizing small-group reading instruction. <em>The Reading Teacher, 76</em>(3), 348–356.</li>
+      </ul>
+    </footer>
+  </main>
+
+  <api-shim></api-shim>
+  <script>
+    // =========================================================================
+    // DATA DEFINITIONS (All strings use backticks for apostrophe/quote safety)
+    // =========================================================================
+
+    const DIAGNOSTIC_SCENARIOS = [
+      {
+        id: `diag-1`,
+        title: `Static Book-Level Grouping`,
+        quote: `“In October, the teacher administers a running record and sorts the class into permanent Blue, Green, and Purple groups by book level (Levels D, G, and J). All year, each group meets daily to read books at that level.”`,
+        correct: `redflag`,
+        verdict: `Playbook Red Flag — Permanent & Book-Level Grouping`,
+        explanation: `Essential #3 explicitly requires flexible groups formed around observed and assessed literacy needs, assets, and standards—never permanent groups or grouping by a general book level (such as “Level J Group”).`,
+        pivotQuestion: `“Looking at your recent decoding and writing samples, which specific skill—like digraphs or story resolution—do three or four students share right now, regardless of their general book level?”`
+      },
+      {
+        id: `diag-2`,
+        title: `Prompting When Stuck on a Word`,
+        quote: `“During small-group reading, a first grader pauses at the word ‘swamp’. The teacher says: ‘Skip it and read to the end of the sentence, or check the picture to see what would make sense there.’”`,
+        correct: `redflag`,
+        verdict: `Playbook Red Flag — Prohibited Word-Guessing Strategy`,
+        explanation: `Under Michigan’s K–12 Literacy and Dyslexia Law and Essential #3 Bullet 2, teachers must NOT prompt students to skip unknown words to guess from context or guess using pictures. Teachers should prompt students to slide through all letters and sounds in the word, then confirm meaning.`,
+        pivotQuestion: `“How can we shift our prompts to ‘Slide through the whole word’ and use ‘blend as you go’ so the student relies on letter-sound knowledge first, then checks for meaning?”`
+      },
+      {
+        id: `diag-3`,
+        title: `Immediate Writing-Data Reteach`,
+        quote: `“After a whole-group narrative writing lesson, the teacher scans notebooks, notices five students struggling to place quotation marks around spoken dialogue, and pulls them for an 8-minute targeted reteach before they revise their own drafts.”`,
+        correct: `aligned`,
+        verdict: `Aligned Practice — Flexible Data-Driven Reteach`,
+        explanation: `This mirrors Small Group 4 in “A Peek in the Classroom.” The group is temporary, tied directly to Tier I whole-group writing instruction, uses visual modeling, and ends with immediate application in students’ own writing.`,
+        pivotQuestion: `“Once these five students apply quotation marks in today’s draft, how will you dissolve this group and form tomorrow’s group based on your next writing or decoding observation?”`
+      },
+      {
+        id: `diag-4`,
+        title: `Low-Performing Group Diet`,
+        quote: `“While advanced groups discuss an informational article and write summaries, the lowest-performing group spends 18 of their 20 small-group minutes completing a cut-and-paste consonant blend worksheet and playing a sight-word memory game.”`,
+        correct: `redflag`,
+        verdict: `Playbook Red Flag — Bullet 1 & Bullet 5 Equity Trap`,
+        explanation: `Playbook Bullet 5 warns that the lowest-performing children often receive the lowest-quality instruction—skill-and-drill worksheets and games instead of actual reading, writing, and meaning-making. Furthermore, memorizing words solely in written form violates code-emphasis guidance.`,
+        pivotQuestion: `“How might we swap the worksheet for 12–15 minutes of word building tied straight into reading a decodable text and talking/writing about what the text means?”`
+      },
+      {
+        id: `diag-5`,
+        title: `Code Coaching + Meaning Confirmation`,
+        quote: `“A second-grade group practices reading multisyllabic words using a systematic decoding routine, immediately reads a connected text containing those patterns, and concludes by discussing why the main character’s feelings changed.”`,
+        correct: `aligned`,
+        verdict: `Aligned Practice — Code + Connected Text + Meaning`,
+        explanation: `This aligns with Bullets 1, 2, 4, and 5: explicit word-recognition strategy instruction applied immediately to connected text, spending most minutes reading and integrating higher-order comprehension (“Integrate and Interpret”).`,
+        pivotQuestion: `“What observational notes did you capture while listening to individuals read that connected text, and how will they inform your next teaching point?”`
+      }
+    ];
+
+    const IES_RECOMMENDATIONS = [
+      {
+        id: `ies-1`,
+        short: `01 · Co-Establish & Model`,
+        title: `Co-establish, model, and teach clear expectations`,
+        tips: [
+          `Establish a consistent attention signal and transition signal.`,
+          `Define what to bring and what to do at each center.`,
+          `Teach expected voice level, where to check visual reminders, and when/how to get help without interrupting the teacher table.`,
+          `Model how to read, write, and talk productively with a partner.`
+        ],
+        scripts: [
+          `“When the chime sounds, you have one minute to quietly pack up and move to your next station. Watch me (teacher models). Now, let’s practice.”`,
+          `“During centers, we use a Level 1 voice. This means speaking quiet enough so only those in your group can hear you.”`
+        ]
+      },
+      {
+        id: `ies-2`,
+        short: `02 · Remind Consistently`,
+        title: `Remind students to engage in expected behaviors`,
+        tips: [
+          `Pre-correct before centers begin and prompt gently while centers are underway.`,
+          `Layer verbal reminders, visual supports (charts, rotation boards, schedules), and nonverbal cues (gestures or brief modeling).`,
+          `Plan calendar checkpoints across the year to revisit and refresh expectations.`
+        ],
+        scripts: [
+          `“Before we begin, remember when you hear the chime, you’ll have one minute to quietly pack up and move to your next station.”`,
+          `Nonverbal move: Point silently to the center rotation chart as a visual support to redirect a child without breaking small-group momentum.`
+        ]
+      },
+      {
+        id: `ies-3`,
+        short: `03 · Praise Specifically`,
+        title: `Acknowledge students through positive attention & specific praise`,
+        tips: [
+          `Acknowledge individuals, small center groups, or the whole class.`,
+          `Anchor praise in exact observable behaviors rather than generic praise.`,
+          `Keep praise sincere and ongoing well beyond the first weeks of school.`
+        ],
+        scripts: [
+          `“Way to go, Group 4! Your teamwork really showed. When you heard the chimes, you worked together to put away materials, pushed in chairs, and quietly moved to your next center.”`
+        ]
+      },
+      {
+        id: `ies-4`,
+        short: `04 · Offer Choice`,
+        title: `Offer instructional choices to increase engagement and agency`,
+        tips: [
+          `Build choice into “Must Do & May Do” centers or let students choose center completion order.`,
+          `Offer choice of materials—such as choosing between two texts practicing the same phonics or comprehension skill.`,
+          `Allow choice between working independently or with a partner on appropriate tasks.`
+        ],
+        scripts: [
+          `“At the listening center, there are three books to choose from. At the writing center, you can choose between making a card or finishing your memoir.”`,
+          `“Today, you may work independently or choose a friend to work with you.”`
+        ]
+      }
+    ];
+
+    const GRR_PHASES = [
+      {
+        id: `launch`,
+        label: `1. Launch & I Do`,
+        rectX: 20,
+        rectW: 205,
+        summary: `Teacher holds primary cognitive load: focusing on critical content, stating clear learning goals, reviewing prior knowledge via retrieval practice, and delivering step-by-step demonstrations (“I Do”).`,
+        elementNums: [1, 2, 3, 4, 5, 6]
+      },
+      {
+        id: `wedo`,
+        label: `2. We Do (Guided)`,
+        rectX: 225,
+        rectW: 205,
+        summary: `Teacher and students share the work: structured guided practice where students respond frequently (verbal, nonverbal, written) with no opt-out.`,
+        elementNums: [7, 9]
+      },
+      {
+        id: `coach`,
+        label: `3. Check & Coach`,
+        rectX: 430,
+        rectW: 205,
+        summary: `Continuous monitoring at a brisk pace: checking for understanding before release and delivering immediate affirmative praise, informative feedback, and corrections.`,
+        elementNums: [8, 10, 11, 12]
+      },
+      {
+        id: `youdo`,
+        label: `4. You Do (Release)`,
+        rectX: 635,
+        rectW: 205,
+        summary: `Students apply the skill independently through judicious, distributed, and cumulative practice—internalizing strategies they can use without adult support.`,
+        elementNums: [13]
+      }
+    ];
+
+    const ELEMENTS_13 = [
+      { num: 1, text: `Focus instruction on critical content.` },
+      { num: 2, text: `Break down complex material into smaller steps and sequence systematically.` },
+      { num: 3, text: `Design organized and focused lessons.` },
+      { num: 4, text: `Begin lessons with a clear statement of lesson goals.` },
+      { num: 5, text: `Review prior skills and knowledge before beginning instruction.` },
+      { num: 6, text: `Provide step-by-step demonstrations (I Do).` },
+      { num: 7, text: `Provide guided practice (We Do).` },
+      { num: 8, text: `Check for understanding before independent practice (You Do).` },
+      { num: 9, text: `Require frequent responses.` },
+      { num: 10, text: `Monitor student performance closely.` },
+      { num: 11, text: `Provide immediate affirmative feedback, informative feedback, and corrections.` },
+      { num: 12, text: `Deliver the lesson at a brisk pace.` },
+      { num: 13, text: `Provide judicious practice (independent, distributed, cumulative).` }
+    ];
+
+    const BULLETS_DATA = [
+      {
+        id: `b1`,
+        num: `01`,
+        short: `Time Reading & Writing`,
+        title: `Bullet 1: Frequent Small Groups Spent Reading & Writing`,
+        summary: `Ensures that children frequently experience small group instruction and use most of their time in small groups to actually read and write (or work toward this goal in kindergarten and early first grade).`,
+        teacher: [
+          `Forms intentional groups from assessment data with a clear teaching point for each group.`,
+          `Plans guided practice maximizing student minutes reading and/or writing.`,
+          `Records notes on strengths and needs while listening to children read and watching them write.`,
+          `Builds background knowledge efficiently—focusing only on what is needed to comprehend the text.`
+        ],
+        children: [
+          `Manipulate materials to build and break apart words.`,
+          `Participate in guided writing and writing about reading.`,
+          `Apply targeted skills across comprehension, vocabulary, decoding, encoding, phonological awareness, and fluency.`,
+          `Read with peers and engage in productive partner talk.`
+        ],
+        environment: [
+          `Variety of texts available (narrative, informational, decodables, poems, articles, digital texts).`,
+          `Seating arranged for easy teacher-student interaction and listening in.`,
+          `Visual rotation boards supporting independence for students outside the group.`
+        ],
+        strategiesTitle: `Maximizing Small Group Minutes`,
+        strategies: [
+          `Avoid lengthy picture walks, extensive teacher talk, or tangential conversations.`,
+          `Limit worksheets and games at the teacher table; prioritize teacher-led embedded reading and writing.`,
+          `Vary reading formats: choral read, echo read, partner read, whisper read, or silent read.`
+        ],
+        checklist: [
+          { id: `chk-b1-1`, label: `Students spend majority of small-group minutes reading, writing, or writing about reading (not worksheets/games).` },
+          { id: `chk-b1-2`, label: `Teacher has a clear, data-informed teaching point matched to the group.` },
+          { id: `chk-b1-3`, label: `Background knowledge is introduced briefly and purposefully without lengthy picture walks.` }
+        ]
+      },
+      {
+        id: `b2`,
+        num: `02`,
+        short: `Coaching Prompts`,
+        title: `Bullet 2: Coaching During Reading & Writing`,
+        summary: `Coaches children as they read and write—with reading prompts focused on letters/letter groups, monitoring for meaning, and rereading, and writing prompts focused on genre, ideation, organization/structure, and mechanics.`,
+        teacher: [
+          `Creates differentiated lesson plans per small group.`,
+          `Uses code-based prompts aligned to child development, text, and task.`,
+          `Provides affirmative and corrective feedback while recording anecdotal data.`
+        ],
+        children: [
+          `Actively use letter-sound knowledge to decode and encode words.`,
+          `Persevere, self-correct, and adjust pronunciation to match print.`,
+          `Apply strategies after prompting and reread to support comprehension.`
+        ],
+        environment: [
+          `Writing tools accessible: editing checklists, alphabet strips, pencil grips, whiteboards, letter formation prompts.`,
+          `Sound-spelling charts and bookmarks with research-supported prompts.`,
+          `Prompts aligned consistently across classrooms and interventions (vertical coherence).`
+        ],
+        strategiesTitle: `5 Scaffolding Pillars & “Slide Through the Whole Word”`,
+        strategies: [
+          `Independence (let them try first) · Wait Time (pause before, during, after) · Struggle (encourage persistence).`,
+          `Alignment (match prompt to child and task) · Connections (link letters and sounds to decode/encode).`,
+          `Slide through the whole word: guide readers from left to right through every letter rather than guessing from initial sounds. Goal: prompts become internalized independent strategies.`
+        ],
+        checklist: [
+          { id: `chk-b2-1`, label: `Teacher uses code-based reading prompts (“slide through the whole word”) rather than picture/context guessing.` },
+          { id: `chk-b2-2`, label: `Teacher provides deliberate wait time so students attempt self-correction first.` },
+          { id: `chk-b2-3`, label: `Writing coaching addresses genre, ideation, organization/structure, and/or mechanics with tools visible.` }
+        ]
+      },
+      {
+        id: `b3`,
+        num: `03`,
+        short: `Fluency Practices`,
+        title: `Bullet 3: Developing Reading Fluency`,
+        summary: `Employs fluency-building practices including repeated reading, echo reading, paired/partner or dyad reading, and continuous or wide reading. Goal: read accurately, at an appropriate pace, and with prosody (expression)—not as fast as possible.`,
+        teacher: [
+          `Models fluent reading demonstrating accuracy, pace, and prosody (expression).`,
+          `Guides varied oral reading routines to build automaticity and deepen comprehension.`,
+          `Offers specific positive feedback on children’s fluency.`
+        ],
+        children: [
+          `Read and reread texts with explicit purposes for rereading.`,
+          `Read collaboratively with partners and reflect on accuracy, automaticity, and prosody (charts, voicing characters).`,
+          `Read for increasingly extended periods to build stamina.`
+        ],
+        environment: [
+          `Diverse text types: decodable books, poetry, narrative, nonfiction, reader’s theater scripts.`,
+          `Visual aids like fluency rubrics or partner-reading checklists.`,
+          `Whisper phones or recording devices for self-monitoring.`
+        ],
+        strategiesTitle: `Four Core Fluency Strategies`,
+        strategies: [
+          `Echo Reading: Teacher reads a sentence; students echo it, imitating pace and expression while keeping eyes on text.`,
+          `Paired Reading: Two students read aloud together (turns or choral) while both keep eyes on print.`,
+          `Dyad Reading: A skilled and less-skilled reader read a shared text in unison side-by-side; pairs reform regularly so every child leads.`,
+          `Wide Reading: Students read across varied genres and topics to expand vocabulary, knowledge, and fluency.`
+        ],
+        checklist: [
+          { id: `chk-b3-1`, label: `Fluency feedback highlights accuracy, appropriate pace, and expression (prosody)—not speed alone.` },
+          { id: `chk-b3-2`, label: `Rereading tasks give students a clear purpose (e.g., character voice, evidence, comprehension).` },
+          { id: `chk-b3-3`, label: `All readers keep eyes continuously on print during echo, paired, or dyad reading.` }
+        ]
+      },
+      {
+        id: `b4`,
+        num: `04`,
+        short: `Explicit Skill Domains`,
+        title: `Bullet 4: Explicit Instruction Across Word, Text, & Writing Domains`,
+        summary: `Includes explicit instruction, as needed, in word recognition (including multisyllabic decoding), text structures, comprehension strategies, oral language, vocabulary, writing goal-setting, and writing strategies.`,
+        teacher: [
+          `Teaches explicit routines for multisyllabic words (e.g., ESHALOV, LETRS Big Words) and heart words.`,
+          `Teaches narrative story elements and expository signal words with graphic organizers.`,
+          `Models comprehension “fix-up” strategies, Reciprocal Teaching, and higher-order questions.`
+        ],
+        children: [
+          `Explain and apply decoding steps, cross-checking words for meaning.`,
+          `Use graphic organizers and sentence frames to analyze text structure and summarize.`,
+          `Use newly learned vocabulary in discourse and articulate personal writing goals.`
+        ],
+        environment: [
+          `Code-based decoding anchor charts and phonics-matched connected texts.`,
+          `Consistent story element and nonfiction text-structure charts across grades.`,
+          `Child-level comprehension charts, word-reference tools, and writing rubrics/checklists.`
+        ],
+        strategiesTitle: `Higher-Order Questions & Reciprocal Teaching`,
+        strategies: [
+          `3 Question Tiers: Locate & Recall (“What did the author tell us…”) · Integrate & Interpret (“How did feelings change and why?”) · Critique & Evaluate (“Was the author effective?”).`,
+          `Reciprocal Teaching: Student-led collaborative discussion cycling through Predicting, Clarifying, Questioning, and Summarizing.`,
+          `Explore the interactive 5-Domain Matrix right below this checklist for detailed indicators.`
+        ],
+        checklist: [
+          { id: `chk-b4-1`, label: `Word-level decoding instruction connects immediately to word meanings and connected text.` },
+          { id: `chk-b4-2`, label: `Comprehension discussion includes Integrate/Interpret or Critique/Evaluate prompts beyond recall.` },
+          { id: `chk-b4-3`, label: `Writing goals and strategies are informed by student writing samples and encourage student ownership.` }
+        ]
+      },
+      {
+        id: `b5`,
+        num: `05`,
+        short: `Quality & Meaning`,
+        title: `Bullet 5: Deliberate Quality & Meaning-Making in ALL Groups`,
+        summary: `Is deliberate in providing high-quality instruction to children in all groups, ensuring meaning-making is the ultimate goal in every group’s work—directly countering the equity gap for lower-performing readers.`,
+        teacher: [
+          `Plans equally rigorous, engaging lessons for students experiencing reading difficulty—avoiding worksheet-heavy “skill and drill.”`,
+          `Connects every foundational decoding task back to comprehension and purpose.`,
+          `Uses Gradual Release (model → collaborate → guided practice → apply) across all groups.`
+        ],
+        children: [
+          `In every group, students read connected text and discuss what they read.`,
+          `Students struggling with decoding still engage in rich oral language, vocabulary, and higher-order thinking.`
+        ],
+        environment: [
+          `Access to rich, knowledge-building texts across every instructional group.`,
+          `Materials and seating communicate high expectations for every learner.`
+        ],
+        strategiesTitle: `Coach Equity Check`,
+        strategies: [
+          `Compare instructional quality across your highest- and lowest-performing groups: do both groups spend most minutes reading, writing, and making meaning?`,
+          `Ensure SSI (Standards, Students, Instruction) alignment prevents watered-down expectations.`
+        ],
+        checklist: [
+          { id: `chk-b5-1`, label: `Lower-performing groups receive explicit, high-rigor instruction and real text reading (not skill-and-drill).` },
+          { id: `chk-b5-2`, label: `Every phonics or word-recognition lesson concludes with meaning-making in connected text.` },
+          { id: `chk-b5-3`, label: `Teacher holds high expectations and engages all groups in thoughtful text discussion.` }
+        ]
+      }
+    ];
+
+    const BULLET4_DOMAINS = [
+      {
+        id: `dom-word`,
+        label: `Word Recognition & Multisyllabic`,
+        teacher: [
+          `Models and revisits decoding strategies with words decodable based on phonics instruction to date.`,
+          `Explicitly teaches a routine for decoding multisyllabic words (e.g., ESHALOV, LETRS Basic Procedure).`,
+          `Ensures children spend most of their time reading and discussing text.`
+        ],
+        children: [
+          `Show awareness of when and how to use decoding strategies.`,
+          `Explain and apply decoding routine steps.`,
+          `Reread for fluency and comprehension after decoding unknown words; cross-check whether the word makes sense.`
+        ],
+        environment: [
+          `Anchor charts for code-based decoding strategies.`,
+          `Reference materials showing taught sound-letter / letter-sound relationships.`,
+          `Connected texts matching the developmental phonics progression.`
+        ],
+        tips: [
+          `After decoding words, always discuss word meanings.`,
+          `Pause to explicitly connect small-group decoding strategies to whole-group phonics lessons.`,
+          `Include time in every decoding lesson to talk about understanding the text.`
+        ]
+      },
+      {
+        id: `dom-struct`,
+        label: `Text Structures`,
+        teacher: [
+          `Establishes clear purposes for reading, such as building knowledge.`,
+          `Describes different narrative and informational text structures.`,
+          `Teaches signal words (e.g., “so that”, “problem”, “because”) that reveal structure.`
+        ],
+        children: [
+          `Use graphic organizers (such as FCRR expository organizers) to learn from texts.`,
+          `Identify narrative elements including setting, characters, problem, and resolution.`
+        ],
+        environment: [
+          `Graphic organizers supporting recall and structural mapping.`,
+          `Charts defining story elements and nonfiction text structures.`
+        ],
+        tips: [
+          `Incorporate content-area informational texts into small groups.`,
+          `Maintain consistent language for text structures, story elements, and visuals across grade levels.`
+        ]
+      },
+      {
+        id: `dom-comp`,
+        label: `Comprehension Strategies`,
+        teacher: [
+          `Explicitly teaches research-supported strategies (predicting, activating prior knowledge, questioning, visualizing, inferring, summarizing).`,
+          `Models “fix-up” strategies when meaning breaks down.`
+        ],
+        children: [
+          `Actively practice comprehension strategies and Reciprocal Teaching roles.`,
+          `Explain the purpose of using strategies and monitor their own understanding.`
+        ],
+        environment: [
+          `Sentence frames and sentence starters for text discussion.`,
+          `Anchor charts of comprehension strategies and child-level strategy bookmarks.`
+        ],
+        tips: [
+          `Ensure tight alignment between children’s assessed needs, instructional tasks, and chosen texts.`,
+          `Integrate higher-order questions across Locate/Recall, Integrate/Interpret, and Critique/Evaluate.`
+        ]
+      },
+      {
+        id: `dom-vocab`,
+        label: `Vocabulary & Oral Language`,
+        teacher: [
+          `Encourages advanced vocabulary use and supplies child-friendly definitions in context.`,
+          `Builds explicit connections between new vocabulary and known language.`
+        ],
+        children: [
+          `Use varied vocabulary and complex sentence structures in peer and teacher discourse.`,
+          `Practice applying newly learned words during talk and writing.`
+        ],
+        environment: [
+          `Diverse, high-quality narrative and informational texts.`,
+          `Word-level reference tools such as child-friendly dictionaries.`
+        ],
+        tips: [
+          `Leverage cognates to honor and connect students’ home languages whenever possible.`,
+          `Promote academic talk with structured discussion protocols and connect oral language to reading and writing.`
+        ]
+      },
+      {
+        id: `dom-write`,
+        label: `Writing Goal Setting & Strategies`,
+        teacher: [
+          `Analyzes data from children’s writing to co-develop targeted instructional goals.`,
+          `Creates goals spanning encoding, grammar usage, vocabulary, peer conferencing, and writing process.`
+        ],
+        children: [
+          `Articulate their personal writing goals.`,
+          `Move deliberately through writing process steps and practice peer revision and peer editing.`
+        ],
+        environment: [
+          `Writing tools visibly available: anchor charts, rubrics, editing and proofreading checklists.`
+        ],
+        tips: [
+          `Increase student motivation by offering meaningful topic and format choices.`,
+          `Use goal setting and self-assessment to help students manage their own writing process.`
+        ]
+      }
+    ];
+
+    const CLASSROOM_CASES = [
+      {
+        num: `Group 01`,
+        focus: `Attending to All the Letters in a Word`,
+        trigger: `Observed reading errors: substituting words that start right and fit context while ignoring middle/ending letters (e.g., reading “house” for “home”).`,
+        routine: `Teacher states the goal, then guides students to physically manipulate letter cards in word ladders (“sat” → “sap” → “tap”) to verify every phoneme-grapheme slot. Lesson concludes with reading a decodable text focusing on checking every letter and sharing with a partner.`,
+        coachLens: `Notice how the teacher replaces guessing habits with tactile letter manipulation followed immediately by connected decodable text and partner meaning-making.`
+      },
+      {
+        num: `Group 02`,
+        focus: `Identifying Problem and Resolution`,
+        trigger: `Unit assessment data: students could identify story events but could not locate or articulate the resolution in narrative texts.`,
+        routine: `Teacher introduces signal words (“so that”, “problem”) and models the “Ask Why?” strategy on familiar passages. Students then practice independently with a read-aloud excerpt to solidify spotting structural cues.`,
+        coachLens: `Notice the SSI link: tied directly to an assessed comprehension standard using shared, consistent structural vocabulary.`
+      },
+      {
+        num: `Group 03`,
+        focus: `Spelling Long /ā/ with “ai” vs. “ay”`,
+        trigger: `Student writing analysis: noticing /ā/ spelling confusion in independent drafts.`,
+        routine: `Through word building and sorting with key words (“wait” and “say”), students apply the positional generalization (“ai” in the middle; “ay” at the end). Students read and write target words, concluding with a short decodable text featuring “ai” and “ay” words.`,
+        coachLens: `Notice the reading-writing reciprocity: data pulled from student writing drives an encoding sort that feeds right back into decodable reading.`
+      },
+      {
+        num: `Group 04 (Reteach)`,
+        focus: `When to Use Quotation Marks in Dialogue`,
+        trigger: `Immediate formative check: shared confusion observed right after a whole-group Tier I writing lesson.`,
+        routine: `Teacher uses a picture book to visually demonstrate that quotation marks enclose exact spoken “talking words.” Students convert simple thought bubbles into punctuated dialogue, then immediately revise their own drafts.`,
+        coachLens: `Notice agility: an on-the-fly, temporary reteach group pulled from whole-group observation that dissolves once mastery is transferred to student drafts.`
+      }
+    ];
+
+    const CURIOSITIES_DATA = [
+      {
+        id: `cur-1`,
+        question: `How can teachers plan efficiently for multiple small groups with very different needs?`,
+        bulletRef: `Planning & Organization`,
+        answer: `Build a visual tracking system that puts every child on one view alongside their current instructional needs—and whenever possible, their strengths and interests. Some teachers use digital spreadsheets or dashboards, while others keep clipboards, charts, or movable sticky notes so groups can be reshuffled weekly without rewriting entire binders.`
+      },
+      {
+        id: `cur-2`,
+        question: `What does “or work toward this goal in kindergarten and early first grade” mean in Bullet 1?`,
+        bulletRef: `Bullet 1`,
+        answer: `Younger learners are still working with very short texts and require heavier teacher modeling and prompting, so their percentage of independent reading/writing minutes will naturally be lower than second or third graders. To maximize their time in text anyway, teachers can have students read multiple short texts in a single session or share the pen during interactive small-group writing.`
+      },
+      {
+        id: `cur-3`,
+        question: `What if a child knows all the letter-sound relationships in a word, is prompted to slide through, and STILL guesses?`,
+        bulletRef: `Bullet 2`,
+        answer: `This usually signals difficulty with phonemic blending rather than letter-sound knowledge. Coach teachers to use the “slide as you go” (or “blend as you go”) strategy: blend the first two sounds into a chunk before adding the third. For “map”: /m/ /ă/ → /mă/ → /mă/ /p/ → /măp/.`
+      },
+      {
+        id: `cur-4`,
+        question: `Are there instances when paired reading or echo reading should be avoided?`,
+        bulletRef: `Bullet 3`,
+        answer: `Apply “everything in moderation.” Students should never ONLY paired read or ONLY echo read. Small groups must include regular opportunities for the teacher to listen to each child read individually in order to deliver precise code/comprehension coaching and inform next instructional steps.`
+      },
+      {
+        id: `cur-5`,
+        question: `When should explicit instruction in multisyllabic word decoding begin?`,
+        bulletRef: `Bullet 4`,
+        answer: `Follow a research-informed systematic scope and sequence. While research does not prescribe a single fixed week, late kindergarten commonly introduces -ing and -ed inflections (e.g., pinning, wanted), first grade introduces two-syllable patterns like VCCV (laptop) and VCCle (little), and multisyllabic decoding accelerates dramatically in second and third grade alongside deep morphology work.`
+      }
+    ];
+
+    const PL_TOPICS = [
+      {
+        id: `pl-guessing`,
+        label: `Replacing Guessing Habits with Code-Based Prompts (Bullet 2 & MI Law)`,
+        anchor: `Playbook Bullet 2 · Michigan Dyslexia Law & “Blend as You Go”`,
+        questions: [
+          `When a student pauses at an unfamiliar word during small group, what is our current reflexive prompt—and does it direct eyes to letters or away from them?`,
+          `How can our grade-level team and interventionists adopt shared prompting language (“slide through the whole word”) so students hear one coherent message?`,
+          `Where might predictable or leveled books still be replacing phonics-aligned connected texts for initial word-recognition practice?`
+        ],
+        nextStep: `Co-create a 3-prompt table tent for small-group tables and practice “blend as you go” during 5-minute whisper-read check-ins.`
+      },
+      {
+        id: `pl-minutes`,
+        label: `Auditing Small-Group Minutes & Raising Equity (Bullets 1 & 5)`,
+        anchor: `Playbook Bullets 1 & 5 · Connor et al. (2011) & Minute Allocation`,
+        questions: [
+          `If we time a 15-minute small group session, how many minutes are students actively reading, writing, and discussing meaning versus listening to teacher talk or doing worksheets?`,
+          `Looking across our highest- and lowest-performing groups, are both receiving equally rich text and meaning-making conversations?`,
+          `Which pre-reading routines (such as lengthy picture walks) can we trim to 60 seconds to reclaim reading minutes?`
+        ],
+        nextStep: `Conduct a non-evaluative 10-minute peer minute-audit using the Playbook Look-For checklist and swap one worksheet routine for guided writing about reading.`
+      },
+      {
+        id: `pl-grouping`,
+        label: `Shifting from Static Levels to SSI Flexible Grouping (Overview & Peek)`,
+        anchor: `Essential #3 × Essential #9 · SSI Framework & Classroom Peeks`,
+        questions: [
+          `What single diagnostic, writing sample, or unit assessment data point will drive next week’s small-group shifts?`,
+          `Which students share a specific skill need (e.g., “ai” vs. “ay”, problem/resolution signal words, quotation marks) regardless of their general reading level?`,
+          `When is our scheduled 2-week checkpoint to dissolve and reform groups?`
+        ],
+        nextStep: `Bring 3 student writing samples and 1 decoding check to Friday’s PLC to draft next week’s SSI small-group plan.`
+      },
+      {
+        id: `pl-centers`,
+        label: `Strengthening Independent Centers via IES Routines (Getting Started)`,
+        anchor: `IES Behavioral Interventions Guide (Lane et al., 2024)`,
+        questions: [
+          `Which moment during center transitions currently pulls the teacher’s attention away from the small-group table?`,
+          `Are expectations supported visually (rotation chart, voice-level guide, “Must Do / May Do” choices) so students solve routine questions without interrupting?`,
+          `How can we weave specific, sincere behavior praise and meaningful text choices into centers this week?`
+        ],
+        nextStep: `Model one transition expectation using a clear chime signal and introduce one “Must Do / May Do” choice board.`
+      }
+    ];
+
+    // =========================================================================
+    // PERSISTENT APPLICATION STATE
+    // =========================================================================
+
+    const appState = {
+      diagIndex: 0,
+      diagAnswers: {},
+      iesActive: `ies-1`,
+      grrActive: `launch`,
+      bulletActive: `b1`,
+      domainActive: `dom-word`,
+      checkedLookFors: {},
+      openCuriosities: { 'cur-1': true },
+      plTopicId: `pl-guessing`,
+      coachContext: ``,
+      coachNotes: ``
+    };
+
+    let saveTimer = null;
+
+    async function persistState() {
+      try {
+        if (window.notebookAppApi && typeof window.notebookAppApi.setAppState === `function`) {
+          await window.notebookAppApi.setAppState(appState);
+          showSaveBanner();
+        }
+      } catch (err) {
+        // Silent resilience outside host sandbox
+      }
+    }
+
+    function schedulePersist() {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () {
+        persistState();
+      }, 250);
+    }
+
+    function showSaveBanner() {
+      const banner = document.getElementById(`save-status`);
+      if (!banner) return;
+      banner.hidden = false;
+      setTimeout(function () {
+        banner.hidden = true;
+      }, 2200);
+    }
+
+    // =========================================================================
+    // RENDERERS & HANDLERS (All HTML handlers use hoisted function syntax)
+    // =========================================================================
+
+    function renderDiagnostic() {
+      const nav = document.getElementById(`diag-nav`);
+      const counter = document.getElementById(`diag-counter`);
+      const quoteEl = document.getElementById(`diag-quote`);
+      const feedbackEl = document.getElementById(`diag-feedback`);
+      const btnAligned = document.getElementById(`btn-aligned`);
+      const btnRed = document.getElementById(`btn-redflag`);
+
+      if (!nav || !counter || !quoteEl || !feedbackEl || !btnAligned || !btnRed) return;
+
+      nav.innerHTML = DIAGNOSTIC_SCENARIOS.map(function (sc, idx) {
+        const answered = appState.diagAnswers[sc.id];
+        const cls = [`scenario-btn`];
+        if (idx === appState.diagIndex) cls.push(`is-current`);
+        if (answered) cls.push(`is-done`);
+        return `<button type="button" class="${cls.join(` `)}" onclick="selectDiagnostic(${idx})">0${idx + 1}${answered ? ` · Logged` : ``}</button>`;
+      }).join(``);
+
+      const current = DIAGNOSTIC_SCENARIOS[appState.diagIndex];
+      counter.textContent = `Scenario ${appState.diagIndex + 1} of ${DIAGNOSTIC_SCENARIOS.length} · ${current.title}`;
+      quoteEl.textContent = current.quote;
+
+      const userChoice = appState.diagAnswers[current.id];
+      btnAligned.className = userChoice === `aligned` ? `btn btn--active` : `btn`;
+      btnRed.className = userChoice === `redflag` ? `btn btn--active` : `btn btn--secondary`;
+
+      if (!userChoice) {
+        feedbackEl.innerHTML = `<p style="font-size: 0.9375rem; color: var(--on-surface-variant);">Select a coaching diagnosis above to compare your assessment against the Playbook and inspect a follow-up debrief question.</p>`;
+      } else {
+        const isCorrect = userChoice === current.correct;
+        const boxClass = isCorrect ? `feedback-box feedback-box--correct` : `feedback-box feedback-box--alert`;
+        const statusText = isCorrect ? `Calibration Match` : `Review Playbook Alignment`;
+        feedbackEl.innerHTML = `
+          <div class="${boxClass}">
+            <div class="figure-card-label">${statusText} · ${current.verdict}</div>
+            <p style="margin-bottom: var(--space-sm);">${current.explanation}</p>
+            <p style="font-size: 0.9375rem;"><strong>Coaching Debrief Question:</strong> ${current.pivotQuestion}</p>
+          </div>
+        `;
+      }
+    }
+
+    function selectDiagnostic(idx) {
+      if (idx < 0 || idx >= DIAGNOSTIC_SCENARIOS.length) return;
+      appState.diagIndex = idx;
+      renderDiagnostic();
+      schedulePersist();
+    }
+
+    function submitDiagnostic(choice) {
+      const current = DIAGNOSTIC_SCENARIOS[appState.diagIndex];
+      if (!current) return;
+      appState.diagAnswers[current.id] = choice;
+      renderDiagnostic();
+      schedulePersist();
+    }
+
+    function renderIesExplorer() {
+      const tabsEl = document.getElementById(`ies-tabs`);
+      const detailEl = document.getElementById(`ies-detail`);
+      if (!tabsEl || !detailEl) return;
+
+      tabsEl.innerHTML = IES_RECOMMENDATIONS.map(function (item) {
+        const active = item.id === appState.iesActive ? ` is-active` : ``;
+        return `
+          <button type="button" class="ies-tab${active}" onclick="selectIes('${item.id}')">
+            <span class="index-num">${item.short}</span>
+            <span class="ies-tab-title">${item.title}</span>
+          </button>
+        `;
+      }).join(``);
+
+      const current = IES_RECOMMENDATIONS.find(function (x) { return x.id === appState.iesActive; }) || IES_RECOMMENDATIONS[0];
+      const tipsHtml = current.tips.map(function (t) { return `<li>${t}</li>`; }).join(``);
+      const scriptsHtml = current.scripts.map(function (s) { return `<div class="script-bubble">${s}</div>`; }).join(``);
+
+      detailEl.innerHTML = `
+        <div>
+          <div class="figure-card-label">Classroom Implementation Tips</div>
+          <ul style="margin: 0; padding-left: var(--space-md); display: flex; flex-direction: column; gap: var(--space-xs);">${tipsHtml}</ul>
+        </div>
+        <div>
+          <div class="figure-card-label">How This Sounds in Action</div>
+          ${scriptsHtml}
+        </div>
+      `;
+    }
+
+    function selectIes(id) {
+      appState.iesActive = id;
+      renderIesExplorer();
+      schedulePersist();
+    }
+
+    function renderGrr() {
+      const pillsEl = document.getElementById(`grr-phase-pills`);
+      const summaryEl = document.getElementById(`grr-phase-summary`);
+      const gridEl = document.getElementById(`elements-13-grid`);
+      const rectEl = document.getElementById(`grr-highlight-rect`);
+      if (!pillsEl || !summaryEl || !gridEl) return;
+
+      pillsEl.innerHTML = GRR_PHASES.map(function (ph) {
+        const cls = ph.id === appState.grrActive ? `btn` : `btn btn--secondary`;
+        return `<button type="button" class="${cls}" onclick="selectGrrPhase('${ph.id}')">${ph.label}</button>`;
+      }).join(``);
+
+      const current = GRR_PHASES.find(function (p) { return p.id === appState.grrActive; }) || GRR_PHASES[0];
+      if (rectEl) {
+        rectEl.setAttribute(`x`, String(current.rectX));
+        rectEl.setAttribute(`width`, String(current.rectW));
+      }
+
+      summaryEl.innerHTML = `
+        <div class="aside-kicker">${current.label} · Instructional Focus</div>
+        <p>${current.summary}</p>
+      `;
+
+      gridEl.innerHTML = ELEMENTS_13.map(function (el) {
+        const isHot = current.elementNums.indexOf(el.num) !== -1;
+        return `
+          <div class="element-item${isHot ? ` is-highlighted` : ``}">
+            <span class="index-num">${el.num < 10 ? `0` + el.num : el.num}</span>
+            <span>${el.text}</span>
+          </div>
+        `;
+      }).join(``);
+    }
+
+    function selectGrrPhase(id) {
+      appState.grrActive = id;
+      renderGrr();
+      schedulePersist();
+    }
+
+    function countCheckedLookFors() {
+      let total = 0;
+      let checked = 0;
+      BULLETS_DATA.forEach(function (b) {
+        b.checklist.forEach(function (item) {
+          total += 1;
+          if (appState.checkedLookFors[item.id]) checked += 1;
+        });
+      });
+      return { checked: checked, total: total };
+    }
+
+    function updateWalkthroughBadge() {
+      const counts = countCheckedLookFors();
+      const topCounter = document.getElementById(`walkthrough-counter`);
+      const badge = document.getElementById(`checklist-badge`);
+      if (topCounter) topCounter.textContent = `Walkthrough Log: ${counts.checked} / ${counts.total} Look-Fors Verified`;
+      if (badge) badge.textContent = `${counts.checked} / ${counts.total} Checked`;
+    }
+
+    function renderBullets() {
+      const selectorEl = document.getElementById(`bullet-selector`);
+      const mountEl = document.getElementById(`bullet-detail-mount`);
+      if (!selectorEl || !mountEl) return;
+
+      selectorEl.innerHTML = BULLETS_DATA.map(function (b) {
+        const active = b.id === appState.bulletActive ? ` is-active` : ``;
+        const doneCount = b.checklist.filter(function (c) { return !!appState.checkedLookFors[c.id]; }).length;
+        return `
+          <button type="button" class="bullet-btn${active}" onclick="selectBullet('${b.id}')">
+            <span class="index-num">Bullet ${b.num} · ${doneCount}/${b.checklist.length}</span>
+            <strong style="font-size: 0.9375rem;">${b.short}</strong>
+          </button>
+        `;
+      }).join(``);
+
+      const cur = BULLETS_DATA.find(function (b) { return b.id === appState.bulletActive; }) || BULLETS_DATA[0];
+      const renderList = function (arr) {
+        return `<ul style="margin: 0; padding-left: var(--space-md); display: flex; flex-direction: column; gap: var(--space-xs); font-size: 0.9375rem;">${arr.map(function (x) { return `<li>${x}</li>`; }).join(``)}</ul>`;
+      };
+
+      const checkHtml = cur.checklist.map(function (chk) {
+        const isChecked = !!appState.checkedLookFors[chk.id];
+        return `
+          <label class="check-item" for="${chk.id}">
+            <input type="checkbox" id="${chk.id}" ${isChecked ? `checked` : ``} onchange="toggleLookFor('${chk.id}', this.checked)">
+            <span>${chk.label}</span>
+          </label>
+        `;
+      }).join(``);
+
+      const stratHtml = cur.strategies.map(function (s) {
+        return `<li style="margin-bottom: var(--space-xs);">${s}</li>`;
+      }).join(``);
+
+      mountEl.innerHTML = `
+        <div style="margin-bottom: var(--space-md);">
+          <h4 style="font-size: var(--subhead-size); margin-bottom: var(--space-xs);">${cur.title}</h4>
+          <p style="font-size: 0.9375rem; color: var(--on-surface-variant);">${cur.summary}</p>
+        </div>
+
+        <div class="lookfor-grid" style="margin-bottom: var(--space-md);">
+          <div class="lookfor-col">
+            <div class="figure-card-label">Look For · Teacher</div>
+            ${renderList(cur.teacher)}
+          </div>
+          <div class="lookfor-col">
+            <div class="figure-card-label">Look For · Children</div>
+            ${renderList(cur.children)}
+          </div>
+          <div class="lookfor-col">
+            <div class="figure-card-label">Look For · Environment</div>
+            ${renderList(cur.environment)}
+          </div>
+        </div>
+
+        <div class="equal-split">
+          <div class="aside-box">
+            <div class="aside-kicker">${cur.strategiesTitle}</div>
+            <ul style="margin: 0; padding-left: var(--space-md); font-size: 0.9375rem;">${stratHtml}</ul>
+          </div>
+          <div class="lookfor-col" style="border-left: 3px solid var(--secondary);">
+            <div class="figure-card-label">Coach Walkthrough Verification (Saved)</div>
+            ${checkHtml}
+          </div>
+        </div>
+      `;
+
+      updateWalkthroughBadge();
+    }
+
+    function selectBullet(id) {
+      appState.bulletActive = id;
+      renderBullets();
+      schedulePersist();
+    }
+
+    function toggleLookFor(id, checked) {
+      appState.checkedLookFors[id] = checked;
+      renderBullets();
+      schedulePersist();
+    }
+
+    function handleResetChecks(btn) {
+      if (!btn) return;
+      if (btn.dataset.armed !== `true`) {
+        btn.dataset.armed = `true`;
+        btn.textContent = `Confirm Reset`;
+        setTimeout(function () {
+          if (btn.dataset.armed === `true`) {
+            btn.dataset.armed = `false`;
+            btn.textContent = `Reset Checklist`;
+          }
+        }, 3500);
+        return;
+      }
+      btn.dataset.armed = `false`;
+      btn.textContent = `Reset Checklist`;
+      appState.checkedLookFors = {};
+      renderBullets();
+      schedulePersist();
+    }
+
+    function renderDomains() {
+      const pillsEl = document.getElementById(`domain-pills`);
+      const mountEl = document.getElementById(`domain-detail-mount`);
+      if (!pillsEl || !mountEl) return;
+
+      pillsEl.innerHTML = BULLET4_DOMAINS.map(function (d) {
+        const cls = d.id === appState.domainActive ? `btn` : `btn btn--secondary`;
+        return `<button type="button" class="${cls}" onclick="selectDomain('${d.id}')">${d.label}</button>`;
+      }).join(``);
+
+      const cur = BULLET4_DOMAINS.find(function (d) { return d.id === appState.domainActive; }) || BULLET4_DOMAINS[0];
+      const toUl = function (items) {
+        return `<ul style="margin: 0; padding-left: var(--space-md); font-size: 0.9375rem; display: flex; flex-direction: column; gap: var(--space-xs);">${items.map(function (i) { return `<li>${i}</li>`; }).join(``)}</ul>`;
+      };
+
+      mountEl.innerHTML = `
+        <div class="lookfor-grid" style="margin-bottom: var(--space-md);">
+          <div class="lookfor-col">
+            <div class="figure-card-label">Teacher Look-Fors</div>
+            ${toUl(cur.teacher)}
+          </div>
+          <div class="lookfor-col">
+            <div class="figure-card-label">Children Look-Fors</div>
+            ${toUl(cur.children)}
+          </div>
+          <div class="lookfor-col">
+            <div class="figure-card-label">Environment Look-Fors</div>
+            ${toUl(cur.environment)}
+          </div>
+        </div>
+        <div class="aside-box">
+          <div class="aside-kicker">Strategies &amp; Coaching Tips · ${cur.label}</div>
+          ${toUl(cur.tips)}
+        </div>
+      `;
+    }
+
+    function selectDomain(id) {
+      appState.domainActive = id;
+      renderDomains();
+      schedulePersist();
+    }
+
+    function renderClassroomCases() {
+      const grid = document.getElementById(`classroom-cases-grid`);
+      if (!grid) return;
+
+      grid.innerHTML = CLASSROOM_CASES.map(function (c) {
+        return `
+          <article class="case-card">
+            <div class="case-meta-row">
+              <span class="tag-chip">${c.num}</span>
+              <span class="dossier-meta">Classroom Example</span>
+            </div>
+            <h3 style="font-size: var(--subhead-size);">${c.focus}</h3>
+            <p style="font-size: 0.9375rem;"><strong>Data Trigger:</strong> ${c.trigger}</p>
+            <p style="font-size: 0.9375rem;"><strong>Instructional Routine:</strong> ${c.routine}</p>
+            <div style="background: var(--surface-container); padding: var(--space-sm) var(--space-md); border-radius: var(--rounded); font-size: 0.9rem;">
+              <strong>Coaching Debrief Lens:</strong> ${c.coachLens}
+            </div>
+          </article>
+        `;
+      }).join(``);
+    }
+
+    function renderCuriosities() {
+      const list = document.getElementById(`curiosities-list`);
+      if (!list) return;
+
+      list.innerHTML = CURIOSITIES_DATA.map(function (item) {
+        const isOpen = !!appState.openCuriosities[item.id];
+        return `
+          <div class="curiosity-item">
+            <button type="button" class="curiosity-trigger" aria-expanded="${isOpen ? `true` : `false`}" onclick="toggleCuriosity('${item.id}')">
+              <span>${item.question}</span>
+              <span class="tag-chip tag-chip--secondary">${item.bulletRef} · ${isOpen ? `Hide` : `Read`}</span>
+            </button>
+            <div class="curiosity-body" ${isOpen ? `` : `hidden`}>
+              <p>${item.answer}</p>
+            </div>
+          </div>
+        `;
+      }).join(``);
+    }
+
+    function toggleCuriosity(id) {
+      appState.openCuriosities[id] = !appState.openCuriosities[id];
+      renderCuriosities();
+      schedulePersist();
+    }
+
+    function renderPlWorkspace() {
+      const selectEl = document.getElementById(`pl-topic-select`);
+      const cardEl = document.getElementById(`pl-protocol-card`);
+      const teacherInput = document.getElementById(`coach-teacher-input`);
+      const notesInput = document.getElementById(`coach-notes-input`);
+
+      if (!selectEl || !cardEl) return;
+
+      selectEl.innerHTML = PL_TOPICS.map(function (t) {
+        const selected = t.id === appState.plTopicId ? `selected` : ``;
+        return `<option value="${t.id}" ${selected}>${t.label}</option>`;
+      }).join(``);
+
+      if (teacherInput && teacherInput.value !== appState.coachContext) {
+        teacherInput.value = appState.coachContext;
+      }
+      if (notesInput && notesInput.value !== appState.coachNotes) {
+        notesInput.value = appState.coachNotes;
+      }
+
+      const topic = PL_TOPICS.find(function (t) { return t.id === appState.plTopicId; }) || PL_TOPICS[0];
+      const qHtml = topic.questions.map(function (q) {
+        return `<li style="margin-bottom: var(--space-xs);">${q}</li>`;
+      }).join(``);
+
+      cardEl.innerHTML = `
+        <div class="aside-kicker">Facilitation Protocol · ${topic.anchor}</div>
+        <p style="font-size: 0.9375rem; font-weight: 600; margin-bottom: var(--space-xs);">Non-Evaluative Inquiry Questions</p>
+        <ul style="margin: 0 0 var(--space-md) 0; padding-left: var(--space-md); font-size: 0.9375rem;">${qHtml}</ul>
+        <p style="font-size: 0.9375rem;"><strong>Suggested 1-Week Action Step:</strong> ${topic.nextStep}</p>
+      `;
+    }
+
+    function selectPlTopic(id) {
+      appState.plTopicId = id;
+      renderPlWorkspace();
+      schedulePersist();
+    }
+
+    function updateCoachNotes() {
+      const teacherInput = document.getElementById(`coach-teacher-input`);
+      const notesInput = document.getElementById(`coach-notes-input`);
+      if (teacherInput) appState.coachContext = teacherInput.value;
+      if (notesInput) appState.coachNotes = notesInput.value;
+      schedulePersist();
+    }
+
+    function handleClearNotes(btn) {
+      if (!btn) return;
+      if (btn.dataset.armed !== `true`) {
+        btn.dataset.armed = `true`;
+        btn.textContent = `Click Again to Clear`;
+        setTimeout(function () {
+          if (btn.dataset.armed === `true`) {
+            btn.dataset.armed = `false`;
+            btn.textContent = `Clear Notes`;
+          }
+        }, 3500);
+        return;
+      }
+      btn.dataset.armed = `false`;
+      btn.textContent = `Clear Notes`;
+      appState.coachContext = ``;
+      appState.coachNotes = ``;
+      renderPlWorkspace();
+      schedulePersist();
+    }
+
+    function exportCoachingBrief() {
+      const topic = PL_TOPICS.find(function (t) { return t.id === appState.plTopicId; }) || PL_TOPICS[0];
+      const counts = countCheckedLookFors();
+      const verifiedItems = [];
+
+      BULLETS_DATA.forEach(function (b) {
+        b.checklist.forEach(function (chk) {
+          if (appState.checkedLookFors[chk.id]) {
+            verifiedItems.push(`- [Bullet ${b.num}] ${chk.label}`);
+          }
+        });
+      });
+
+      const lines = [
+        `EARLY LITERACY ESSENTIAL #3 — COACHING & PL DEBRIEF BRIEF`,
+        `============================================================`,
+        `Context / Team: ${appState.coachContext || `(Not specified)`}`,
+        `PL Focus: ${topic.label}`,
+        `Playbook Anchor: ${topic.anchor}`,
+        ``,
+        `FACILITATION QUESTIONS:`,
+        topic.questions.map(function (q, i) { return `${i + 1}. ${q}`; }).join(`\n`),
+        ``,
+        `SUGGESTED 1-WEEK ACTION STEP:`,
+        topic.nextStep,
+        ``,
+        `WALKTHROUGH LOOK-FORS VERIFIED (${counts.checked} / ${counts.total}):`,
+        verifiedItems.length > 0 ? verifiedItems.join(`\n`) : `(No walkthrough items checked yet.)`,
+        ``,
+        `COACH OBSERVATION NOTES & COMMITMENTS:`,
+        appState.coachNotes || `(No written notes added yet.)`
+      ];
+
+      const content = lines.join(`\n`);
+      const feedbackEl = document.getElementById(`export-feedback`);
+
+      try {
+        if (window.notebookAppApi && typeof window.notebookAppApi.triggerFileDownload === `function`) {
+          window.notebookAppApi.triggerFileDownload({
+            content: content,
+            contentType: `text/plain`,
+            encoding: `UTF-8`,
+            filename: `essential-3-coaching-brief.txt`
+          });
+          if (feedbackEl) feedbackEl.textContent = `Brief exported as essential-3-coaching-brief.txt.`;
+        } else {
+          const blob = new Blob([content], { type: `text/plain;charset=utf-8` });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement(`a`);
+          a.href = url;
+          a.download = `essential-3-coaching-brief.txt`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          if (feedbackEl) feedbackEl.textContent = `Brief downloaded as essential-3-coaching-brief.txt.`;
+        }
+      } catch (err) {
+        if (feedbackEl) feedbackEl.textContent = `Unable to trigger file export in this preview pane; copy your notes from the text field above.`;
+      }
+    }
+
+    // =========================================================================
+    // INITIALIZATION
+    // =========================================================================
+
+    function renderAll() {
+      renderDiagnostic();
+      renderIesExplorer();
+      renderGrr();
+      renderBullets();
+      renderDomains();
+      renderClassroomCases();
+      renderCuriosities();
+      renderPlWorkspace();
+    }
+
+    async function initApp() {
+      try {
+        if (window.notebookAppApi && typeof window.notebookAppApi.getAppState === `function`) {
+          const saved = await window.notebookAppApi.getAppState();
+          if (saved && typeof saved === `object`) {
+            if (typeof saved.diagIndex === `number`) appState.diagIndex = saved.diagIndex;
+            if (saved.diagAnswers && typeof saved.diagAnswers === `object`) appState.diagAnswers = saved.diagAnswers;
+            if (typeof saved.iesActive === `string`) appState.iesActive = saved.iesActive;
+            if (typeof saved.grrActive === `string`) appState.grrActive = saved.grrActive;
+            if (typeof saved.bulletActive === `string`) appState.bulletActive = saved.bulletActive;
+            if (typeof saved.domainActive === `string`) appState.domainActive = saved.domainActive;
+            if (saved.checkedLookFors && typeof saved.checkedLookFors === `object`) appState.checkedLookFors = saved.checkedLookFors;
+            if (saved.openCuriosities && typeof saved.openCuriosities === `object`) appState.openCuriosities = saved.openCuriosities;
+            if (typeof saved.plTopicId === `string`) appState.plTopicId = saved.plTopicId;
+            if (typeof saved.coachContext === `string`) appState.coachContext = saved.coachContext;
+            if (typeof saved.coachNotes === `string`) appState.coachNotes = saved.coachNotes;
+          }
+        }
+      } catch (err) {
+        // Fallback to clean initial state
+      }
+
+      renderAll();
+
+      try {
+        if (window.notebookAppApi && typeof window.notebookAppApi.notifyAppReady === `function`) {
+          window.notebookAppApi.notifyAppReady();
+        }
+      } catch (err) {
+        // Ignore outside host environment
+      }
+    }
+
+    initApp();
+  </script>
+</body>
+</html>
